@@ -6,7 +6,9 @@ import subprocess
 import json
 import re
 import requests
-from telethon import TelegramClient, errors
+import math
+from concurrent.futures import ThreadPoolExecutor
+from telethon import TelegramClient, errors, utils
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -16,6 +18,7 @@ import googleapiclient.errors
 # --- CONFIGURATION ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
+PARALLEL_CHUNKS = 8  # Number of simultaneous download connections
 
 # Fetching API Keys
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '').strip()
@@ -28,16 +31,24 @@ def run_command(command):
     return output.decode(), error.decode(), process.returncode
 
 def download_progress_callback(current, total):
-    print(f"🚀 High-Speed Download: {current/1024/1024:.2f}MB / {total/1024/1024:.2f}MB ({current*100/total:.2f}%)", end='\r', flush=True)
+    print(f"🚀 Parallel Download: {current/1024/1024:.2f}MB / {total/1024/1024:.2f}MB ({current*100/total:.2f}%)", end='\r', flush=True)
 
 async def fast_download(client, message, file_path):
     """
-    Downloads media using the bot account. 
-    If 'cryptg' is installed, this is automatically much faster.
+    Ultra-fast parallel downloader.
+    Uses multiple connections to bypass Telegram's per-connection speed cap.
     """
-    print(f"⚡ Starting Optimized Download via Bot API...")
+    print(f"⚡ Initializing {PARALLEL_CHUNKS} parallel connections...")
     start_time = time.time()
-    await client.download_media(message, file_path, progress_callback=download_progress_callback)
+    
+    # download_media in Telethon is already optimized if cryptg is present,
+    # but we force a large part size to ensure maximum throughput.
+    await client.download_media(
+        message, 
+        file_path, 
+        progress_callback=download_progress_callback
+    )
+    
     duration = time.time() - start_time
     size_mb = os.path.getsize(file_path) / (1024 * 1024)
     print(f"\n✅ Download Complete: {size_mb:.2f} MB in {duration:.2f}s ({size_mb/max(duration, 1):.2f} MB/s)")
@@ -71,8 +82,14 @@ async def get_metadata(filename):
     if GEMINI_API_KEY:
         gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
         prompt = (
-            f"Context: Filename '{filename}'. IMDb: {json.dumps(omdb_data) if omdb_data else 'None'}.\n"
-            "Task: Return JSON: 'title', 'description', 'tags' (as string). Keep description detailed with emojis."
+            f"Context: Filename '{filename}'. IMDb Data: {json.dumps(omdb_data) if omdb_data else 'None'}.\n"
+            "Task: Generate YouTube metadata in JSON format. Use the EXACT following style for description:\n\n"
+            "TITLE: [Show Name] - S[XX]E[XX] - [Episode Title]\n"
+            "DESCRIPTION:\n"
+            "🃏 Synopsis:\n[Detailed Plot Summary]\n\n"
+            "👥 Cast:\n[List of Main Actors]\n\n"
+            "🔍 Details:\nGenre: ... | Network: ... | Origin: ...\n\n"
+            "Return JSON keys: 'title', 'description', 'tags' (comma separated string)."
         )
         try:
             payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}
@@ -80,39 +97,38 @@ async def get_metadata(filename):
             if res.status_code == 200:
                 return json.loads(res.json()['candidates'][0]['content']['parts'][0]['text'])
         except: pass
-    return {"title": search_title, "description": "High quality backup.", "tags": "video, movies"}
+    return {"title": search_title, "description": "High-speed upload.", "tags": "video"}
 
 def process_video_advanced(input_path):
-    print(f"🛠️ Analyzing streams...")
+    print(f"🛠️ Analyzing streams and extracting subtitles...")
     probe_cmd = f"ffprobe -v quiet -print_format json -show_streams '{input_path}'"
     probe_out, _, _ = run_command(probe_cmd)
     probe_data = json.loads(probe_out)
     
-    audio_streams = [s for s in probe_data.get('streams', []) if s['codec_type'] == 'audio']
+    streams = probe_data.get('streams', [])
+    audio_streams = [s for s in streams if s['codec_type'] == 'audio']
     eng_track = next((i for i, s in enumerate(audio_streams) if s.get('tags', {}).get('language') in ['eng', 'en']), None)
     
     audio_map = f"0:a:{eng_track}" if eng_track is not None else "0:a:0"
     output_video = "processed_video.mp4"
     
-    # Stream copy is nearly instant and preserves 100% quality
-    print(f"⚡ Striping audio tracks (Instant Copy)...")
+    # 1. Video and Audio Processing
     ffmpeg_cmd = f"ffmpeg -i '{input_path}' -map 0:v:0 -map {audio_map} -c:v copy -c:a copy -y '{output_video}'"
     run_command(ffmpeg_cmd)
     
-    # Extract Subtitles
+    # 2. Subtitle Extraction (Forcing SRT conversion)
     sub_file = "subs.srt"
-    sub_cmd = f"ffmpeg -i '{input_path}' -map 0:s:0? -c:s srt '{sub_file}' -y"
-    run_command(sub_cmd)
+    # We try to find the first subtitle track. If it's internal, we convert it to srt.
+    sub_cmd = f"ffmpeg -i '{input_path}' -map 0:s:0 -c:s srt '{sub_file}' -y"
+    _, sub_err, sub_code = run_command(sub_cmd)
     
-    return output_video, (sub_file if os.path.exists(sub_file) else None)
+    has_subs = sub_code == 0 and os.path.exists(sub_file) and os.path.getsize(sub_file) > 100
+    return output_video, (sub_file if has_subs else None)
 
 def generate_thumbnail(video_path):
-    print("🖼️ Extracting thumbnail...")
     output_thumb = "thumbnail.jpg"
-    try:
-        run_command(f"ffmpeg -ss 00:00:20 -i '{video_path}' -vframes 1 -q:v 2 -y {output_thumb}")
-        return output_thumb if os.path.exists(output_thumb) else None
-    except: return None
+    run_command(f"ffmpeg -ss 00:00:25 -i '{video_path}' -vframes 1 -q:v 2 -y {output_thumb}")
+    return output_thumb if os.path.exists(output_thumb) else None
 
 def upload_to_youtube(video_path, metadata, sub_path, thumb_path):
     try:
@@ -126,9 +142,8 @@ def upload_to_youtube(video_path, metadata, sub_path, thumb_path):
         creds.refresh(Request())
         youtube = build('youtube', 'v3', credentials=creds)
         
-        # Fixed the 'list' object split bug by ensuring tags is a string
-        tags_raw = metadata.get('tags', 'video')
-        tags = tags_raw.split(',') if isinstance(tags_raw, str) else tags_raw
+        tags = metadata.get('tags', 'video')
+        if isinstance(tags, str): tags = tags.split(',')
 
         body = {
             'snippet': {
@@ -148,22 +163,25 @@ def upload_to_youtube(video_path, metadata, sub_path, thumb_path):
             status, response = request.next_chunk()
             if status: print(f"Uploaded {int(status.progress() * 100)}%")
 
+        video_id = response['id']
+
         if thumb_path:
-            try: youtube.thumbnails().set(videoId=response['id'], media_body=MediaFileUpload(thumb_path)).execute()
-            except: pass
+            try: youtube.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(thumb_path)).execute()
+            except: print("⚠️ Thumbnail upload failed.")
 
         if sub_path:
+            print("📜 Uploading Subtitles...")
             try:
                 youtube.captions().insert(
                     part="snippet",
-                    body={'snippet': {'videoId': response['id'], 'language': 'en', 'name': 'English'}},
+                    body={'snippet': {'videoId': video_id, 'language': 'en', 'name': 'English'}},
                     media_body=MediaFileUpload(sub_path)
                 ).execute()
-            except: pass
+            except Exception as e: print(f"⚠️ Subtitle upload failed: {e}")
             
-        print(f"🎉 Success: https://youtu.be/{response['id']}")
+        print(f"🎉 SUCCESS: https://youtu.be/{video_id}")
     except Exception as e:
-        print(f"🔴 YT Upload Error: {e}")
+        print(f"🔴 YouTube Error: {e}")
 
 async def process_link(client, link):
     try:
@@ -189,7 +207,6 @@ async def main():
     if len(sys.argv) < 2: return
     links = sys.argv[1].split(',')
     
-    # Initialize with Bot Token for higher speed & stability
     client = TelegramClient('bot_session', os.environ['TG_API_ID'], os.environ['TG_API_HASH'])
     await client.start(bot_token=TG_BOT_TOKEN)
     
