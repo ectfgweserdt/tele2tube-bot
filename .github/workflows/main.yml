@@ -1,0 +1,34 @@
+name: Fast Telegram to YouTube Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_link:
+        description: 'Telegram Links (Comma separated)'
+        required: true
+        type: string
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+      - name: Install High-Speed Libraries
+        run: pip install -r requirements.txt
+      - name: Execute
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python uploader_script.py "${{ github.event.inputs.telegram_link }}"
