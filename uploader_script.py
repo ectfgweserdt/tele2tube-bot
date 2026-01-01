@@ -14,10 +14,12 @@ from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 import googleapiclient.errors
 
-# --- CONFIGURATION ---
+# --- OPTIMIZED CONFIGURATION ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
-PARALLEL_CHUNKS = 32  # Increased to 32 for maximum throughput
+
+# 16-20 is the sweet spot for single-core environments to avoid thread contention
+PARALLEL_CHUNKS = 18 
 
 # Fetching API Keys
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '').strip()
@@ -38,8 +40,8 @@ class ProgressTracker:
 
     def update(self, current_size):
         now = time.time()
-        # Throttle UI updates to prevent slowing down the event loop at high speeds
-        if now - self.last_ui_update < 0.3 and current_size < self.total_size:
+        # Throttling UI to 1 update per second to maximize CPU for networking
+        if now - self.last_ui_update < 1.0 and current_size < self.total_size:
             return
         
         self.last_ui_update = now
@@ -59,21 +61,18 @@ class ProgressTracker:
         sys.stdout.flush()
 
 async def fast_download(client, message, file_path):
-    """Parallel downloader using optimized chunking."""
-    print(f"📡 Initializing Extreme Parallel Download ({PARALLEL_CHUNKS} threads)...")
+    """Parallel downloader with optimized buffer."""
+    print(f"📡 Initializing Speed-Optimized Download...")
     total_size = message.file.size
     tracker = ProgressTracker(total_size, prefix='📥 Downloading')
 
-    def progress_call(current, total):
-        tracker.update(current)
-
     start_time = time.time()
     
-    # download_media handles parallel requests based on the internal configuration
+    # download_media uses internal parallel logic
     await client.download_media(
         message, 
         file_path, 
-        progress_callback=progress_call
+        progress_callback=lambda c, t: tracker.update(c)
     )
     
     duration = time.time() - start_time
@@ -117,7 +116,7 @@ async def get_metadata(filename):
             "🃏 Synopsis:\n[Engaging 3-4 sentence summary]\n\n"
             "👥 Cast:\n[Actor 1, Actor 2, Actor 3...]\n\n"
             "🔍 Details:\nGenre: ... | Network/Studio: ... | Origin: ...\n\n"
-            "Return JSON with 'title', 'description', 'tags'."
+            "Return JSON with 'title', 'description', 'tags' (string or list)."
         )
         try:
             payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}
@@ -162,12 +161,21 @@ def upload_to_youtube(video_path, metadata, sub_path):
         creds.refresh(Request())
         youtube = build('youtube', 'v3', credentials=creds)
         
+        # --- FIX: Handle tags correctly whether string or list ---
+        raw_tags = metadata.get('tags', 'video')
+        if isinstance(raw_tags, str):
+            tags_list = [t.strip() for t in raw_tags.split(',')]
+        elif isinstance(raw_tags, list):
+            tags_list = raw_tags
+        else:
+            tags_list = ["video"]
+
         print(f"🚀 Initializing YouTube Upload...")
         body = {
             'snippet': {
                 'title': metadata.get('title', 'Video')[:95],
                 'description': metadata.get('description', ''),
-                'tags': metadata.get('tags', '').split(','),
+                'tags': tags_list,
                 'categoryId': '24'
             },
             'status': {'privacyStatus': 'private'}
@@ -226,7 +234,16 @@ async def process_link(client, link):
 async def main():
     if len(sys.argv) < 2: return
     links = sys.argv[1].split(',')
-    client = TelegramClient('bot_session', os.environ['TG_API_ID'], os.environ['TG_API_HASH'])
+    # Optimized client params
+    client = TelegramClient(
+        'bot_session', 
+        os.environ['TG_API_ID'], 
+        os.environ['TG_API_HASH'],
+        request_retries=15,
+        connection_retries=15,
+        retry_delay=2,
+        auto_reconnect=True
+    )
     await client.start(bot_token=TG_BOT_TOKEN)
     for link in links:
         await process_link(client, link)
