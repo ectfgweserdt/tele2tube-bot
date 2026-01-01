@@ -1,1 +1,5 @@
-telethoncryptggoogle-api-python-clientgoogle-auth-oauthlibgoogle-auth-httplib2requests
+telethon
+cryptg
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2requests
