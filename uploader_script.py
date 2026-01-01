@@ -15,7 +15,6 @@ from google.oauth2.credentials import Credentials
 import googleapiclient.errors
 
 # --- CONFIGURATION ---
-# This MUST match the scope used in your get_refresh_token.py
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 
@@ -33,7 +32,6 @@ def download_progress_callback(current, total):
     print(f"🚀 Parallel Download: {current/1024/1024:.2f}MB / {total/1024/1024:.2f}MB ({current*100/total:.2f}%)", end='\r', flush=True)
 
 async def fast_download(client, message, file_path):
-    print(f"⚡ Initializing parallel connections...")
     start_time = time.time()
     await client.download_media(message, file_path, progress_callback=download_progress_callback)
     duration = time.time() - start_time
@@ -72,7 +70,7 @@ async def get_metadata(filename):
             f"Context: Filename '{filename}'. IMDb Data: {json.dumps(omdb_data) if omdb_data else 'None'}.\n"
             "Task: Generate YouTube metadata in JSON format. Return EXACTLY this format:\n"
             "TITLE: Alice in Borderland - S03E06 - The Game Master's Trap\n"
-            "DESCRIPTION:\n🃏 Synopsis:\n[Summary]\n\n👥 Cast:\n[Actors]\n\n🔍 Details:\nGenre: ... | Network: ...\n\n"
+            "DESCRIPTION:\n🃏 Synopsis:\n[Detailed Plot Summary]\n\n👥 Cast:\n[List of Main Actors]\n\n🔍 Details:\nGenre: ... | Network: ... | Origin: ...\n\n"
             "Return JSON keys: 'title', 'description', 'tags' (string)."
         )
         try:
@@ -99,11 +97,19 @@ def process_video_advanced(input_path):
     # Process Video/Audio
     run_command(f"ffmpeg -i '{input_path}' -map 0:v:0 -map {audio_map} -c:v copy -c:a copy -y '{output_video}'")
     
-    # Extract Subs
+    # Extract Subs (Try to force SRT format from first subtitle stream)
     sub_file = "subs.srt"
-    _, _, sub_code = run_command(f"ffmpeg -i '{input_path}' -map 0:s:0 -c:s srt '{sub_file}' -y")
+    run_command(f"ffmpeg -i '{input_path}' -map 0:s:0 -c:s srt '{sub_file}' -y")
     
-    has_subs = sub_code == 0 and os.path.exists(sub_file) and os.path.getsize(sub_file) > 100
+    # Verify if sub_file is valid and not empty
+    has_subs = os.path.exists(sub_file) and os.path.getsize(sub_file) > 100
+    if has_subs:
+        # Final check: does it look like an SRT?
+        with open(sub_file, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read(100)
+            if '-->' not in content and '1' not in content:
+                has_subs = False
+
     return output_video, (sub_file if has_subs else None)
 
 def generate_thumbnail(video_path):
@@ -136,7 +142,7 @@ def upload_to_youtube(video_path, metadata, sub_path, thumb_path):
             'status': {'privacyStatus': 'private'}
         }
         
-        print(f"🚀 Uploading to YouTube...")
+        print(f"🚀 Uploading Video...")
         media = MediaFileUpload(video_path, chunksize=1024*1024*10, resumable=True)
         request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
         response = None
@@ -151,12 +157,21 @@ def upload_to_youtube(video_path, metadata, sub_path, thumb_path):
             except: pass
 
         if sub_path:
-            print("📜 Uploading Subtitles...")
+            print("📜 Uploading Subtitles (Forcing Publication)...")
             try:
+                # We add sync=True to tell YouTube to process it immediately if possible
                 youtube.captions().insert(
                     part="snippet",
-                    body={'snippet': {'videoId': video_id, 'language': 'en', 'name': 'English'}},
-                    media_body=MediaFileUpload(sub_path)
+                    body={
+                        'snippet': {
+                            'videoId': video_id, 
+                            'language': 'en', 
+                            'name': 'English',
+                            'isDraft': False # Ensure it's not a draft
+                        }
+                    },
+                    media_body=MediaFileUpload(sub_path),
+                    sync=True 
                 ).execute()
             except Exception as e:
                 print(f"⚠️ Subtitle upload failed: {e}")
