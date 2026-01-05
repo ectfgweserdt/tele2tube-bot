@@ -19,7 +19,7 @@ YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 
 # 16-20 is the sweet spot for single-core environments to avoid thread contention
-PARALLEL_CHUNKS = 18 
+PARALLEL_CHUNKS = 25
 
 # Fetching API Keys
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '').strip()
