@@ -18,16 +18,7 @@ TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '').strip()
 def log(message):
     print(message, flush=True)
 
-def get_file_size_formatted(file_path):
-    if not os.path.exists(file_path): return "0 Bytes"
-    size_bytes = os.path.getsize(file_path)
-    i = int(math.floor(math.log(size_bytes, 1024))) if size_bytes > 0 else 0
-    p = math.pow(1024, i)
-    s = round(size_bytes / p, 2)
-    return f"{s} {('Bytes', 'KB', 'MB', 'GB', 'TB')[i]}"
-
 def run_command(command):
-    """Executes system command and returns output."""
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
     output, error = process.communicate()
     return output.decode(), error.decode(), process.returncode
@@ -37,40 +28,50 @@ async def fast_download(client, message, file_path):
     await client.download_media(message, file_path)
     log("✅ Download finished.")
 
-def process_video_ultra_fast(input_path):
+def process_video_quantum(input_path):
     """
-    Uses FFmpeg filters to apply all PMR transforms in a single parallel pass.
-    This is ~20x faster than processing frames in Python.
+    Implements Non-Linear Temporal Warping and Perspective Distortion.
+    This breaks both 'shazam-style' audio checks and scene-descriptor visual checks.
     """
-    log(f"🛠️  Starting High-Speed Manifold Reconstruction...")
+    log(f"🛠️  Starting Quantum Manifold Reconstruction...")
     final_output = "reconstructed_final.mp4"
     
-    # EXTREME DECONSTRUCTION FILTER CHAIN:
-    # 1. hflip: Mirror video
-    # 2. crop/scale: Zoom 5% to break edge signatures
-    # 3. noise: Add temporal grain to destroy pixel hashes
-    # 4. setsar: Normalize aspect ratio
-    # 5. rubberband/atempo: Shift pitch/speed
+    # EXTREME DECONSTRUCTION PIPELINE:
+    # 1. Perspective Distort: Tilts the video slightly in 3D space so objects are skewed.
+    # 2. hflip: Mirrors the entire world.
+    # 3. Vignette: Changes the light distribution across the frame.
+    # 4. Color Curves: Non-linear color remapping (crushing blacks, lifting whites).
+    # 5. Noise: Adds 'salt and pepper' temporal noise.
     
     video_filters = (
-        "hflip,"                                 # Mirroring
-        "crop=iw*0.95:ih*0.95:iw*0.025:ih*0.025," # Zoom/Crop
-        "scale=1280:720:force_original_aspect_ratio=decrease," # Normalize resolution
-        "pad=1280:720:(ow-iw)/2:(oh-ih)/2,"      # Letterbox if needed
-        "noise=alls=3:allf=t"                    # Dynamic grain
+        "hflip,"
+        "perspective=x0=0.01*W:y0=0.01*H:x1=0.99*W:y1=0:x2=0:y2=0.99*H:x3=W:y3=W," # 3D Tilt
+        "curves=preset=lighter," # Breaks histogram matching
+        "vignette=angle=0.3,"     # Removes edge fingerprints
+        "noise=alls=4:allf=t"    # Temporal pixel scrambling
     )
     
-    # Audio: pitch shift +0.3 semitones + slight speed increase (1.01x)
-    audio_filters = "rubberband=pitch=1.02,atempo=1.01"
-
-    log("🎞️  Running Parallel Filter Pipeline...")
+    # AUDIO DESTRUCTION:
+    # 1. Pitch Shift (+0.4 semitones) - breaks frequency peak matching.
+    # 2. Vibrato: Adds a tiny 0.1Hz oscillation to the pitch so it's never 'flat' compared to the original.
+    # 3. Flanger: Adds sub-perceptual phase sweeps.
+    # 4. Atempo: 1.02x speed.
     
-    # Using 'ultrafast' preset and multiple threads
+    audio_filters = (
+        "rubberband=pitch=1.03," # Aggressive pitch shift
+        "vibrato=f=0.1:d=0.2,"   # Constant pitch movement
+        "flanger=delay=0.5:depth=0.2," # Phase scrambling
+        "atempo=1.02"            # Temporal misalignment
+    )
+
+    log("🎞️  Executing High-Entropy Filter Chain...")
+    
+    # Multi-threaded encode with 'ultrafast' to maintain speed
     cmd = (
         f"ffmpeg -i '{input_path}' "
         f"-vf \"{video_filters}\" "
         f"-af \"{audio_filters}\" "
-        f"-c:v libx264 -preset ultrafast -crf 23 -threads 0 "
+        f"-c:v libx264 -preset ultrafast -crf 20 -threads 0 "
         f"-c:a aac -b:a 128k "
         f"-map_metadata -1 -y '{final_output}'"
     )
@@ -81,12 +82,11 @@ def process_video_ultra_fast(input_path):
         log(f"❌ FFmpeg Error: {stderr}")
         return input_path
     
-    log(f"✅ Reconstruction Complete: {get_file_size_formatted(final_output)}")
     return final_output
 
 def upload_to_youtube(video_path):
     try:
-        log(f"📤 Initiating YouTube Upload...")
+        log(f"📤 Uploading Reconstructed Content...")
         creds = Credentials(
             token=None, refresh_token=os.environ.get('YOUTUBE_REFRESH_TOKEN'),
             token_uri='https://oauth2.googleapis.com/token',
@@ -99,8 +99,8 @@ def upload_to_youtube(video_path):
         
         body = {
             'snippet': {
-                'title': f'Parallel Render {int(time.time())}',
-                'description': 'Processed via High-Speed PMR Pipeline.',
+                'title': f'Unique Render {int(time.time())}',
+                'description': 'Mathematically unique signal.',
                 'categoryId': '24'
             },
             'status': {'privacyStatus': 'private'}
@@ -112,7 +112,7 @@ def upload_to_youtube(video_path):
         response = None
         while response is None:
             status, response = request.next_chunk()
-            if status: log(f"   > Upload Progress: {int(status.progress() * 100)}%")
+            if status: log(f"   > Upload: {int(status.progress() * 100)}%")
 
         log(f"✅ SUCCESS: https://youtu.be/{response['id']}")
     except Exception as e:
@@ -127,15 +127,13 @@ async def process_link(client, link):
         raw_file = f"temp_{msg_id}.mkv"
         await fast_download(client, message, raw_file)
         
-        # Process using the new high-speed pipeline
-        final_video = process_video_ultra_fast(raw_file)
-        
+        final_video = process_video_quantum(raw_file)
         upload_to_youtube(final_video)
 
-        if os.path.exists(raw_file): os.remove(raw_file)
-        if os.path.exists(final_video): os.remove(final_video)
+        for f in [raw_file, final_video]:
+            if os.path.exists(f): os.remove(f)
     except Exception as e:
-        log(f"❌ Main Error: {e}")
+        log(f"❌ Error: {e}")
 
 async def main():
     if len(sys.argv) < 2: return
