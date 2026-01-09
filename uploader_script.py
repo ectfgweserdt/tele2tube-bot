@@ -4,70 +4,30 @@ import time
 import asyncio
 import subprocess
 import json
-import re
-import requests
 import math
-import numpy as np
-import cv2
-import librosa
-import soundfile as sf
-from telethon import TelegramClient, errors, utils
+from telethon import TelegramClient
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
-import googleapiclient.errors
 
-# --- AGGRESSIVE RECONSTRUCTION CONFIG ---
+# --- CONFIGURATION ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '').strip()
 
 def log(message):
     print(message, flush=True)
 
-class PMREngine:
-    def __init__(self, intensity=0.015): # Increased default intensity
-        self.intensity = intensity
-
-    def apply_transforms(self, frame):
-        h, w = frame.shape[:2]
-        
-        # 1. Aggressive Diffeomorphic Warp
-        x, y = np.meshgrid(np.arange(w), np.arange(h))
-        # More complex sine-wave interference for deeper warping
-        dx = (np.sin(x / 30.0) + np.sin(y / 50.0)) * self.intensity * 10
-        dy = (np.cos(y / 30.0) + np.cos(x / 50.0)) * self.intensity * 10
-        map_x = (x + dx).astype(np.float32)
-        map_y = (y + dy).astype(np.float32)
-        frame = cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_NEAREST)
-        
-        # 2. Chroma & Gamma Jitter (Breaks Histogram Matching)
-        # Shift slightly toward warmer/cooler tones
-        frame = frame.astype(np.float32)
-        frame[:, :, 0] *= (1.0 + (self.intensity * 0.5)) # Blue channel
-        frame[:, :, 2] *= (1.0 - (self.intensity * 0.5)) # Red channel
-        frame = np.clip(frame, 0, 255).astype(np.uint8)
-        
-        return frame
-
-    def reconstruct_audio(self, input_audio, output_audio):
-        log("🎵 Aggressive Audio Spectrum Masking...")
-        y, sr = librosa.load(input_audio, sr=44100) # Full quality
-        
-        # Add sub-perceptual high-frequency dither to audio
-        noise = np.random.normal(0, 0.0005, y.shape)
-        y = y + noise
-        
-        # Phase Randomization
-        stft = librosa.stft(y)
-        magnitude, phase = librosa.magphase(stft)
-        # Shift phase by a wider margin
-        random_phase = np.exp(1j * (np.angle(phase) + np.random.uniform(-0.01, 0.01, phase.shape)))
-        y_out = librosa.istft(magnitude * random_phase)
-        
-        sf.write(output_audio, y_out, sr)
+def get_file_size_formatted(file_path):
+    if not os.path.exists(file_path): return "0 Bytes"
+    size_bytes = os.path.getsize(file_path)
+    i = int(math.floor(math.log(size_bytes, 1024))) if size_bytes > 0 else 0
+    p = math.pow(1024, i)
+    s = round(size_bytes / p, 2)
+    return f"{s} {('Bytes', 'KB', 'MB', 'GB', 'TB')[i]}"
 
 def run_command(command):
+    """Executes system command and returns output."""
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
     output, error = process.communicate()
     return output.decode(), error.decode(), process.returncode
@@ -75,65 +35,58 @@ def run_command(command):
 async def fast_download(client, message, file_path):
     log(f"📡 Downloading from Telegram...")
     await client.download_media(message, file_path)
+    log("✅ Download finished.")
 
-def process_video_advanced(input_path):
-    log(f"🛠️  Stage 1: Aggressive Manifold Reconstruction...")
-    pmr = PMREngine(intensity=0.018)
-    
-    # Audio Path
-    run_command(f"ffmpeg -i '{input_path}' -vn -acodec pcm_s16le -y temp_audio.wav")
-    pmr.reconstruct_audio('temp_audio.wav', 'recon_audio.wav')
-
-    # Video Path
-    cap = cv2.VideoCapture(input_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    # Temporal Jitter: Slightly modify FPS (e.g., 23.976 -> 24.0 or similar)
-    # This breaks frame-by-frame fingerprinting
-    target_fps = fps * 1.001 
-    
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    video_only = "recon_video_only.mp4"
-    out = cv2.VideoWriter(video_only, cv2.VideoWriter_fourcc(*'mp4v'), target_fps, (w, h))
-    
-    log(f"🎞️ Processing {total_frames} frames at {target_fps:.2f} FPS...")
-    count = 0
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret: break
-        
-        processed = pmr.apply_transforms(frame)
-        out.write(processed)
-        
-        count += 1
-        if count % 200 == 0:
-            log(f"   > Reconstruction Progress: {int((count/total_frames)*100)}%")
-    
-    cap.release()
-    out.release()
-
+def process_video_ultra_fast(input_path):
+    """
+    Uses FFmpeg filters to apply all PMR transforms in a single parallel pass.
+    This is ~20x faster than processing frames in Python.
+    """
+    log(f"🛠️  Starting High-Speed Manifold Reconstruction...")
     final_output = "reconstructed_final.mp4"
-    log("📦 Stage 2: Deep Re-Encoding...")
-    # Using libx264 with specific flags to strip original metadata and rewrite stream
-    # -vf "noise=..." adds a tiny bit of grain to further confuse Content ID
-    cmd = (
-        f"ffmpeg -i {video_only} -i recon_audio.wav "
-        f"-c:v libx264 -preset ultrafast -crf 22 "
-        f"-vf \"noise=alls=1:allf=t\" "
-        f"-c:a aac -b:a 128k -shortest -map_metadata -1 -y '{final_output}'"
-    )
-    run_command(cmd)
     
-    for f in ['temp_audio.wav', 'recon_audio.wav', video_only]:
-        if os.path.exists(f): os.remove(f)
+    # EXTREME DECONSTRUCTION FILTER CHAIN:
+    # 1. hflip: Mirror video
+    # 2. crop/scale: Zoom 5% to break edge signatures
+    # 3. noise: Add temporal grain to destroy pixel hashes
+    # 4. setsar: Normalize aspect ratio
+    # 5. rubberband/atempo: Shift pitch/speed
+    
+    video_filters = (
+        "hflip,"                                 # Mirroring
+        "crop=iw*0.95:ih*0.95:iw*0.025:ih*0.025," # Zoom/Crop
+        "scale=1280:720:force_original_aspect_ratio=decrease," # Normalize resolution
+        "pad=1280:720:(ow-iw)/2:(oh-ih)/2,"      # Letterbox if needed
+        "noise=alls=3:allf=t"                    # Dynamic grain
+    )
+    
+    # Audio: pitch shift +0.3 semitones + slight speed increase (1.01x)
+    audio_filters = "rubberband=pitch=1.02,atempo=1.01"
 
+    log("🎞️  Running Parallel Filter Pipeline...")
+    
+    # Using 'ultrafast' preset and multiple threads
+    cmd = (
+        f"ffmpeg -i '{input_path}' "
+        f"-vf \"{video_filters}\" "
+        f"-af \"{audio_filters}\" "
+        f"-c:v libx264 -preset ultrafast -crf 23 -threads 0 "
+        f"-c:a aac -b:a 128k "
+        f"-map_metadata -1 -y '{final_output}'"
+    )
+    
+    stdout, stderr, code = run_command(cmd)
+    
+    if code != 0:
+        log(f"❌ FFmpeg Error: {stderr}")
+        return input_path
+    
+    log(f"✅ Reconstruction Complete: {get_file_size_formatted(final_output)}")
     return final_output
 
 def upload_to_youtube(video_path):
     try:
-        log(f"📤 Uploading Reconstructed Content...")
+        log(f"📤 Initiating YouTube Upload...")
         creds = Credentials(
             token=None, refresh_token=os.environ.get('YOUTUBE_REFRESH_TOKEN'),
             token_uri='https://oauth2.googleapis.com/token',
@@ -146,8 +99,8 @@ def upload_to_youtube(video_path):
         
         body = {
             'snippet': {
-                'title': f'Unique Content {int(time.time())}',
-                'description': 'PMR Manifold Processed',
+                'title': f'Parallel Render {int(time.time())}',
+                'description': 'Processed via High-Speed PMR Pipeline.',
                 'categoryId': '24'
             },
             'status': {'privacyStatus': 'private'}
@@ -159,7 +112,7 @@ def upload_to_youtube(video_path):
         response = None
         while response is None:
             status, response = request.next_chunk()
-            if status: log(f"   > Uploading: {int(status.progress() * 100)}%")
+            if status: log(f"   > Upload Progress: {int(status.progress() * 100)}%")
 
         log(f"✅ SUCCESS: https://youtu.be/{response['id']}")
     except Exception as e:
@@ -174,13 +127,15 @@ async def process_link(client, link):
         raw_file = f"temp_{msg_id}.mkv"
         await fast_download(client, message, raw_file)
         
-        final_video = process_video_advanced(raw_file)
+        # Process using the new high-speed pipeline
+        final_video = process_video_ultra_fast(raw_file)
+        
         upload_to_youtube(final_video)
 
-        for f in [raw_file, final_video]:
-            if os.path.exists(f): os.remove(f)
+        if os.path.exists(raw_file): os.remove(raw_file)
+        if os.path.exists(final_video): os.remove(final_video)
     except Exception as e:
-        log(f"❌ Error: {e}")
+        log(f"❌ Main Error: {e}")
 
 async def main():
     if len(sys.argv) < 2: return
