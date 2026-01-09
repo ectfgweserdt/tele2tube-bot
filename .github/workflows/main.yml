@@ -16,18 +16,29 @@ concurrency:
 jobs:
   upload:
     runs-on: ubuntu-latest
+    # Increased timeout because PMR reconstruction (warping/phase-shifting) takes more time
+    timeout-minutes: 360 
     steps:
       - uses: actions/checkout@v4
+      
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install Tools
+          cache: 'pip'
+
+      - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
-      - name: Install High-Speed Libraries
-        run: pip install --no-cache-dir -r requirements.txt
-      - name: Execute
+          # libsndfile1 is required by librosa/soundfile for audio reconstruction
+          # ffmpeg is required for video merging and stream manipulation
+          sudo apt-get install -y ffmpeg libsndfile1
+          
+      - name: Install Python Libraries
+        run: |
+          pip install --upgrade pip
+          pip install --no-cache-dir -r requirements.txt
+          
+      - name: Execute PMR Pipeline
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
