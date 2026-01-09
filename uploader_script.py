@@ -38,22 +38,24 @@ class PMREngine:
         self.intensity = intensity
 
     def apply_transforms(self, frame):
-        # Reduced complexity for GitHub Actions CPU
         h, w = frame.shape[:2]
+        # Optimize: Create maps once if frame size is constant, 
+        # but for simplicity/robustness we generate per frame here with simplified math
         x, y = np.meshgrid(np.arange(w), np.arange(h))
         dx = np.sin(x / 40.0) * self.intensity * 5
         dy = np.cos(y / 40.0) * self.intensity * 5
         map_x = (x + dx).astype(np.float32)
         map_y = (y + dy).astype(np.float32)
-        # Using INTER_NEAREST for speed on low-resource runners
-        frame = cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_NEAREST)
-        return frame
+        # Use INTER_NEAREST for maximum speed on GitHub Runners
+        return cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_NEAREST)
 
     def reconstruct_audio(self, input_audio, output_audio):
         print("🎵 Reconstructing Audio Spectrum...")
-        y, sr = librosa.load(input_audio, sr=22050) # Downsample slightly for speed
+        # Downsample for processing speed
+        y, sr = librosa.load(input_audio, sr=22050) 
         stft = librosa.stft(y)
         magnitude, phase = librosa.magphase(stft)
+        # Shift phase sub-perceptually
         random_phase = np.exp(1j * (np.angle(phase) + np.random.uniform(-0.002, 0.002, phase.shape)))
         y_out = librosa.istft(magnitude * random_phase)
         sf.write(output_audio, y_out, sr)
@@ -71,7 +73,7 @@ class ProgressTracker:
 
     def update(self, current_size):
         now = time.time()
-        if now - self.last_ui_update < 2.0: return
+        if now - self.last_ui_update < 5.0: return # Reduced logging frequency
         self.last_ui_update = now
         percentage = (current_size / self.total_size) * 100
         print(f"🚀 Download: {percentage:.1f}%")
@@ -84,18 +86,23 @@ def process_video_advanced(input_path):
     print(f"🛠️  Stage 1: PMR Manifold Reconstruction...")
     pmr = PMREngine()
     
-    # Audio Step
+    # Audio Reconstruction
     run_command(f"ffmpeg -i '{input_path}' -vn -acodec pcm_s16le -ar 22050 -y temp_audio.wav")
     pmr.reconstruct_audio('temp_audio.wav', 'recon_audio.wav')
 
-    # Video Step
+    # Video Reconstruction
     cap = cv2.VideoCapture(input_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
-    w, h = int(cap.get(cv2.CAP_PROP_WIDTH)), int(cap.get(cv2.CAP_PROP_HEIGHT))
+    # FIX: Use explicit full property names
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
+    if w == 0 or h == 0:
+        print("❌ Error: Could not read video dimensions.")
+        return input_path
+
     video_only = "recon_video_only.mp4"
-    # Using 'mp4v' for speed, merging later with x264
     out = cv2.VideoWriter(video_only, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
     
     print(f"🎞️ Processing {total_frames} frames...")
@@ -103,9 +110,13 @@ def process_video_advanced(input_path):
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
-        out.write(pmr.apply_transforms(frame))
+        
+        # Apply Manifold Transforms
+        processed = pmr.apply_transforms(frame)
+        out.write(processed)
+        
         count += 1
-        if count % 100 == 0:
+        if count % 200 == 0:
             print(f"   > Processed {count}/{total_frames} frames...")
     
     cap.release()
@@ -113,9 +124,10 @@ def process_video_advanced(input_path):
 
     final_output = "reconstructed_final.mp4"
     print("📦 Finalizing Encodes...")
-    # Use 'ultrafast' preset to prevent timeout on 40MB+ files
-    run_command(f"ffmpeg -i {video_only} -i recon_audio.wav -c:v libx264 -preset ultrafast -crf 23 -c:a aac -shortest -y '{final_output}'")
+    # Ultrafast preset is essential for GitHub Actions to avoid timeouts
+    run_command(f"ffmpeg -i {video_only} -i recon_audio.wav -c:v libx264 -preset ultrafast -crf 24 -c:a aac -shortest -y '{final_output}'")
     
+    # Cleanup
     for f in ['temp_audio.wav', 'recon_audio.wav', video_only]:
         if os.path.exists(f): os.remove(f)
 
@@ -123,7 +135,9 @@ def process_video_advanced(input_path):
 
 def upload_to_youtube(video_path):
     try:
-        print(f"📤 Uploading {get_file_size_formatted(video_path)} to YouTube...")
+        size_str = get_file_size_formatted(video_path)
+        print(f"📤 Uploading {size_str} to YouTube...")
+        
         creds = Credentials(
             token=None, refresh_token=os.environ.get('YOUTUBE_REFRESH_TOKEN'),
             token_uri='https://oauth2.googleapis.com/token',
@@ -135,7 +149,11 @@ def upload_to_youtube(video_path):
         youtube = build('youtube', 'v3', credentials=creds)
         
         body = {
-            'snippet': {'title': 'Reconstructed Video', 'categoryId': '24'},
+            'snippet': {
+                'title': 'Reconstructed Content',
+                'description': 'Mathematically unique perceptual reconstruction.',
+                'categoryId': '24'
+            },
             'status': {'privacyStatus': 'private'}
         }
         
