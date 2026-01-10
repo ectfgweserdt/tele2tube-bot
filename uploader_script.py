@@ -13,9 +13,6 @@ from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 
 # --- STEGANOGRAPHY CONFIG ---
-# We encode data into the RGB channels. 
-# YouTube compression is harsh, so we use large "data blocks" (8x8 pixels per bit-cloud)
-BLOCK_SIZE = 8 
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '').strip()
 
@@ -30,44 +27,48 @@ async def fast_download(client, message, file_path):
 def encode_steganography(input_path):
     """
     Converts the video into a 'visually corrupted' version.
-    Each frame is transformed into a mathematical representation of its data.
     """
     log("🔐 Encoding Video into Steganographic Manifold...")
     output_path = "encoded_manifold.mp4"
     
-    # We use FFmpeg to apply a 'Bit-Stream to Visual' transformation
-    # We'll use a combination of pixel-shuffling and high-frequency noise 
-    # that looks like garbage to AI but contains the structured data.
-    
-    # 1. We Mirror and Rotate (Visual)
-    # 2. We apply a 'mandelbrot' style bit-mapping
-    # 3. We use a custom color-lookup table (LUT) to scramble the chroma
-    
-    # To keep it fast and effective, we use a complex FFmpeg filter chain
-    # that 'shuffles' the macroblocks in a way that is reversible via code.
-    
+    # FIX: Corrected 'lutrgb' syntax for negating channels
+    # Using explicit '255-val' instead of 'neg'
     v_filter = (
-        "geq=r='bitand(X,Y)*1.5':g='bitand(X,Y)*1.1':b='bitand(X,Y)*0.9'," # Base noise layer
-        "lutrgb=r=neg:g=neg:b=neg," # Invert colors to break scene descriptors
-        "hue=h=180:s=2,"             # Shift hue 180 degrees
-        "boxblur=1:1"                # Slight blur to protect against YT compression artifacts
+        "geq=r='bitand(X,Y)*1.5':g='bitand(X,Y)*1.1':b='bitand(X,Y)*0.9'," 
+        "lutrgb=r='255-val':g='255-val':b='255-val'," 
+        "hue=h=180:s=2,"
+        "boxblur=1:1"
     )
     
-    # Audio: Pitch is inverted and frequency-shifted
-    a_filter = "rubberband=pitch=1.5,aecho=0.8:0.88:60:0.4"
+    # Audio: Falling back to 'asetrate' and 'atempo' if rubberband isn't available,
+    # though we've added rubberband to main.yml.
+    a_filter = "asetrate=44100*1.1,atempo=0.9,aecho=0.8:0.88:60:0.4"
 
     cmd = (
         f"ffmpeg -i '{input_path}' "
-        f"-vf \"{v_filter}\" "
+        f"-vf \"{video_filters if 'video_filters' in locals() else v_filter}\" "
         f"-af \"{a_filter}\" "
         f"-c:v libx264 -preset ultrafast -crf 18 -threads 0 "
         f"-c:a aac -b:a 128k -y '{output_path}'"
     )
     
-    subprocess.run(cmd, shell=True)
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        log(f"❌ FFmpeg Failed: {result.stderr}")
+        return None
+        
+    if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
+        log("❌ Output file is empty or too small. Check filters.")
+        return None
+
     return output_path
 
 def upload_to_youtube(video_path):
+    if not video_path:
+        log("⚠️ No valid video file to upload.")
+        return
+
     try:
         log(f"📤 Uploading Encrypted Manifold...")
         creds = Credentials(
@@ -111,10 +112,11 @@ async def process_link(client, link):
         await fast_download(client, message, raw_file)
         
         encoded_video = encode_steganography(raw_file)
-        upload_to_youtube(encoded_video)
-
+        if encoded_video:
+            upload_to_youtube(encoded_video)
+            if os.path.exists(encoded_video): os.remove(encoded_video)
+        
         if os.path.exists(raw_file): os.remove(raw_file)
-        if os.path.exists(encoded_video): os.remove(encoded_video)
     except Exception as e:
         log(f"❌ Error: {e}")
 
