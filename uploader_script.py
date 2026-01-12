@@ -15,11 +15,14 @@ from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 import googleapiclient.errors
 
+# Force output to show immediately in GitHub Actions
+print("🚀 [SYSTEM] Script started. Initializing environment...", flush=True)
+
 # --- PERFORMANCE ENGINE ---
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    print("🚀 [SYSTEM] uvloop enabled.")
+    print("🚀 [SYSTEM] uvloop enabled.", flush=True)
 except ImportError:
     pass
 
@@ -56,7 +59,8 @@ class SwarmTracker:
         async with self.lock:
             self.bot_progress[bot_index] += size
             now = time.time()
-            if now - self.last_log_time >= 5.0:
+            # Log more frequently (every 2 seconds) to confirm activity
+            if now - self.last_log_time >= 2.0:
                 self.last_log_time = now
                 self.log_status()
 
@@ -66,19 +70,17 @@ class SwarmTracker:
         speed = (total_dl / 1024 / 1024) / max(elapsed, 0.1)
         percent = (total_dl / self.total_size) * 100
         
-        print(f"📊 Progress: {percent:5.1f}% | Global Speed: {speed:5.2f} MB/s | {total_dl//1024//1024}/{self.total_size//1024//1024} MB")
+        print(f"📊 Progress: {percent:5.1f}% | Global Speed: {speed:5.2f} MB/s | {total_dl//1024//1024}/{self.total_size//1024//1024} MB", flush=True)
         for i, prog in enumerate(self.bot_progress):
             if prog > 0:
                 bot_speed = (prog / 1024 / 1024) / max(elapsed, 0.1)
-                print(f"   > Bot-{i}: {prog//1024//1024}MB ({bot_speed:.2f} MB/s)")
-        sys.stdout.flush()
+                print(f"   > Bot-{i}: {prog//1024//1024}MB ({bot_speed:.2f} MB/s)", flush=True)
 
 async def download_segment(bot_index, client, location, start_offset, end_offset, fd, tracker):
     sem = asyncio.Semaphore(CONCURRENT_PER_BOT)
     for offset in range(start_offset, end_offset, CHUNK_SIZE):
         limit = min(CHUNK_SIZE, end_offset - offset)
         async with sem:
-            # Jitter to avoid simultaneous requests per bot
             await asyncio.sleep(random.uniform(0.01, 0.05))
             for attempt in range(12):
                 try:
@@ -90,46 +92,44 @@ async def download_segment(bot_index, client, location, start_offset, end_offset
                 except errors.FloodWaitError as e:
                     await asyncio.sleep(e.seconds + 2)
                 except Exception:
-                    await asyncio.sleep(2 ** attempt / 2)
+                    await asyncio.sleep(1.5 ** attempt)
 
 async def multi_bot_download(link, file_path):
-    print(f"🔥 [INIT] Starting swarm with {len(BOT_TOKENS)} bots...")
+    print(f"🔥 [INIT] Starting swarm with {len(BOT_TOKENS)} bots...", flush=True)
     clients = []
     try:
-        # SEQUENTIAL START TO PREVENT AUTH_KEY ERRORS
         for i, token in enumerate(BOT_TOKENS):
             device = random.choice(DEVICE_MODELS)
-            # Use distinct session names and aggressive connection retries
+            # Short timeout to prevent infinite hang on auth_key gen
             c = TelegramClient(
-                f'swarm_bot_{i}_{int(time.time())}', 
+                f'bot_{i}_{int(time.time())}', 
                 TG_API_ID, TG_API_HASH, 
                 device_model=device[0],
-                connection_retries=15,
-                retry_delay=3
+                timeout=20,
+                connection_retries=5
             )
             
-            # Initial jitter before connecting to avoid "invalid nonce" collision
-            await asyncio.sleep(random.uniform(1.0, 5.0))
-            
+            await asyncio.sleep(random.uniform(1.0, 3.0))
             try:
-                await c.start(bot_token=token)
+                # Use wait_for to ensure we don't hang here forever
+                await asyncio.wait_for(c.start(bot_token=token), timeout=30)
                 clients.append(c)
-                print(f"✅ Bot {i} Online ({device[0]})")
-                # Wait for the session to be fully established before next one
-                await asyncio.sleep(4) 
+                print(f"✅ Bot {i} Online ({device[0]})", flush=True)
+                await asyncio.sleep(2)
             except Exception as e:
-                print(f"⚠️ Bot {i} Auth Failed: {e}")
+                print(f"⚠️ Bot {i} failed to initialize: {e}", flush=True)
 
         if not clients:
-            raise Exception("No bots were able to connect.")
+            raise Exception("Zero bots connected. Check API keys and tokens.")
 
+        print("🔗 Parsing link and fetching metadata...", flush=True)
         parts = [p for p in link.strip('/').split('/') if p]
         msg_id, chat_id = int(parts[-1]), int(f"-100{parts[parts.index('c')+1]}")
         msg = await clients[0].get_messages(chat_id, ids=msg_id)
         
         file_size = msg.file.size
         location = utils.get_input_location(msg.media)
-        print(f"📂 File: {msg.file.name} ({file_size//1024//1024} MB)")
+        print(f"📂 File Found: {msg.file.name} ({file_size//1024//1024} MB)", flush=True)
 
         with open(file_path, "wb") as f: f.truncate(file_size)
         fd = os.open(file_path, os.O_RDWR)
@@ -140,9 +140,10 @@ async def multi_bot_download(link, file_path):
         for i, client in enumerate(clients):
             tasks.append(download_segment(i, client, location, i*seg, min(file_size, (i+1)*seg), fd, tracker))
         
+        print(f"🚀 [ACTION] Parallel download started across {len(clients)} bots...", flush=True)
         await asyncio.gather(*tasks)
         os.close(fd)
-        print("✅ Download Finished.")
+        print("✅ Download Finished.", flush=True)
     finally:
         for c in clients: 
             try: await c.disconnect()
@@ -150,14 +151,13 @@ async def multi_bot_download(link, file_path):
 
 def process_video_advanced(input_path):
     output = "ready.mp4"
-    print(f"🎬 [FFMPEG] Remuxing...")
-    # Use -map 0 to ensure all stream references are preserved for YouTube ingest
+    print(f"🎬 [FFMPEG] Remuxing for YouTube compatibility...", flush=True)
     cmd = f"ffmpeg -i '{input_path}' -c copy -map 0 -movflags +faststart -y '{output}'"
     run_command(cmd)
     return output if os.path.exists(output) else input_path
 
 def upload_to_youtube(path):
-    print(f"📤 [YOUTUBE] Starting upload...")
+    print(f"📤 [YOUTUBE] Starting upload...", flush=True)
     try:
         creds = Credentials(
             token=None, refresh_token=os.environ.get('YOUTUBE_REFRESH_TOKEN'),
@@ -177,13 +177,15 @@ def upload_to_youtube(path):
         response = None
         while response is None:
             status, response = request.next_chunk()
-            if status: print(f" 📤 Upload Progress: {int(status.progress() * 100)}%")
-        print(f"✨ SUCCESS: https://youtu.be/{response['id']}")
+            if status: print(f" 📤 Upload Progress: {int(status.progress() * 100)}%", flush=True)
+        print(f"✨ SUCCESS: https://youtu.be/{response['id']}", flush=True)
     except Exception as e:
-        print(f"❌ YouTube Error: {e}")
+        print(f"❌ YouTube Error: {e}", flush=True)
 
 async def main():
-    if len(sys.argv) < 2: return
+    if len(sys.argv) < 2: 
+        print("❌ Error: No link provided.", flush=True)
+        return
     for link in sys.argv[1].split(','):
         raw = f"dl_{int(time.time())}.mkv"
         try:
@@ -193,7 +195,7 @@ async def main():
             for f in [raw, processed]:
                 if os.path.exists(f): os.remove(f)
         except Exception as e:
-            print(f"❌ Main Loop Error: {e}")
+            print(f"❌ Main Loop Error: {e}", flush=True)
 
 if __name__ == '__main__':
     asyncio.run(main())
