@@ -63,28 +63,34 @@ class SwarmTracker:
 
 async def bot_worker(bot_index, token, chat_id, msg_id, start, end, file_path, tracker):
     device = random.choice(DEVICE_MODELS)
-    # Using unique session names to avoid SQLite lock issues
-    client = TelegramClient(f'bot_sess_{bot_index}_{int(time.time())}', TG_API_ID, TG_API_HASH, device_model=device[0])
+    client_id = f'bot_sess_{bot_index}_{int(time.time())}'
+    client = TelegramClient(client_id, TG_API_ID, TG_API_HASH, device_model=device[0])
+    
     fd = None
     try:
         await client.start(bot_token=token)
         message = await client.get_messages(chat_id, ids=msg_id)
         from telethon.tl.functions.upload import GetFileRequest
         
+        # Ensure fd is opened once per worker
         fd = os.open(file_path, os.O_RDWR)
-        chunk_size = 512 * 1024
+        
+        # 512KB (Exactly 524288 bytes) is mandatory for alignment
+        chunk_size = 512 * 1024 
         current_offset = start
         
         while current_offset < end:
             limit = min(chunk_size, end - current_offset)
             success = False
-            for attempt in range(5):
+            
+            # More aggressive retry logic for the same chunk
+            for attempt in range(10):
                 try:
                     result = await asyncio.wait_for(client(GetFileRequest(
                         utils.get_input_location(message.media),
                         offset=current_offset,
                         limit=limit
-                    )), timeout=30)
+                    )), timeout=60)
                     
                     if result and result.bytes:
                         os.pwrite(fd, result.bytes, current_offset)
@@ -92,17 +98,19 @@ async def bot_worker(bot_index, token, chat_id, msg_id, start, end, file_path, t
                         await tracker.update(bot_index, current_offset - start)
                         success = True
                         break
-                except asyncio.TimeoutError:
-                    pass 
-                except errors.FloodWaitError as e:
-                    await asyncio.sleep(e.seconds)
-                except Exception:
-                    await asyncio.sleep(2)
+                except (asyncio.TimeoutError, errors.RPCError, Exception) as e:
+                    # On failure, wait and try to reconnect if needed
+                    wait_time = (attempt + 1) * 2
+                    await asyncio.sleep(wait_time)
+                    if not client.is_connected():
+                        await client.connect()
             
             if not success:
-                print(f"❌ [Bot-{bot_index}] Halted at {current_offset}.", flush=True)
+                print(f"❌ [Bot-{bot_index}] Hard fail at offset {current_offset}.", flush=True)
                 break
 
+    except Exception as e:
+        print(f"❌ [Bot-{bot_index}] Worker crashed: {e}", flush=True)
     finally:
         if fd is not None:
             os.close(fd)
@@ -125,20 +133,22 @@ async def multi_bot_download(link, file_path):
         f.truncate(file_size)
     
     tracker = SwarmTracker(file_size, len(BOT_TOKENS))
-    seg = math.ceil(file_size / len(BOT_TOKENS))
+    # Align segments to 512KB boundaries
+    seg_size = (file_size // len(BOT_TOKENS))
+    seg_size = (seg_size // (512 * 1024)) * (512 * 1024)
     
     tasks = []
     for i, token in enumerate(BOT_TOKENS):
-        start = i * seg
-        end = min(file_size, (i + 1) * seg)
-        # FIX: Explicitly create a Task
+        start = i * seg_size
+        # Last bot takes the remainder
+        end = (i + 1) * seg_size if i < len(BOT_TOKENS) - 1 else file_size
+        
         t = asyncio.create_task(bot_worker(i, token, chat_id, msg_id, start, end, file_path, tracker))
         tasks.append(t)
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
 
     print(f"🚀 [ACTION] Swarm download active (Total: {len(tasks)} tasks)...", flush=True)
     
-    # Heartbeat monitoring loop
     start_wait = time.time()
     while True:
         done, pending = await asyncio.wait(tasks, timeout=10)
@@ -146,12 +156,11 @@ async def multi_bot_download(link, file_path):
             break
             
         elapsed = time.time() - start_wait
-        if elapsed > 900: # 15 min hard timeout
-            print("⚠️ [TIMEOUT] Swarm taking too long. Terminating pending tasks.", flush=True)
+        if elapsed > 1200: # 20 min hard timeout
+            print("⚠️ [TIMEOUT] Force closing.", flush=True)
             for p in pending: p.cancel()
             break
             
-        # Heartbeat log to show we are still waiting
         if len(done) < len(tasks):
              print(f"💓 Heartbeat: {len(done)}/{len(tasks)} bots finished...", flush=True)
 
@@ -202,7 +211,6 @@ async def main():
             for f in [raw, processed]:
                 if os.path.exists(f): os.remove(f)
         except Exception as e:
-            # Fixed error logging to not treat string as coroutine
             print(f"❌ Critical Error: {str(e)}", flush=True)
 
 if __name__ == '__main__':
