@@ -21,17 +21,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          
-      - name: Install System Tools
+          cache: 'pip' # Speed up workflow startup
+      - name: Install Tools
         run: |
           sudo apt-get update
-          # librubberband2 is required for high-quality pitch/tempo shifting
-          sudo apt-get install -y ffmpeg librubberband2
-          
-      - name: Install Python Dependencies
-        run: pip install --no-cache-dir -r requirements.txt
-
-      - name: Execute Stegano Pipeline
+          # build-essential and python3-dev ensure uvloop/cryptg compile successfully if needed
+          sudo apt-get install -y ffmpeg build-essential python3-dev
+      - name: Install High-Speed Libraries
+        run: pip install -r requirements.txt
+      - name: Execute
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -39,4 +37,6 @@ jobs:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
         run: python uploader_script.py "${{ github.event.inputs.telegram_link }}"
