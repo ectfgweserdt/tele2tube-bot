@@ -56,7 +56,6 @@ class SwarmTracker:
         async with self.lock:
             self.bot_progress[bot_index] += size
             now = time.time()
-            # Log every 5 seconds to avoid flooding GitHub logs but keep user informed
             if now - self.last_log_time >= 5.0:
                 self.last_log_time = now
                 self.log_status()
@@ -79,7 +78,9 @@ async def download_segment(bot_index, client, location, start_offset, end_offset
     for offset in range(start_offset, end_offset, CHUNK_SIZE):
         limit = min(CHUNK_SIZE, end_offset - offset)
         async with sem:
-            for attempt in range(10):
+            # Jitter to avoid simultaneous requests per bot
+            await asyncio.sleep(random.uniform(0.01, 0.05))
+            for attempt in range(12):
                 try:
                     result = await client(GetFileRequest(location, offset, limit))
                     if result and result.bytes:
@@ -87,21 +88,40 @@ async def download_segment(bot_index, client, location, start_offset, end_offset
                         await tracker.update(bot_index, len(result.bytes))
                         break
                 except errors.FloodWaitError as e:
-                    await asyncio.sleep(e.seconds + 1)
+                    await asyncio.sleep(e.seconds + 2)
                 except Exception:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(2 ** attempt / 2)
 
 async def multi_bot_download(link, file_path):
     print(f"🔥 [INIT] Starting swarm with {len(BOT_TOKENS)} bots...")
     clients = []
     try:
+        # SEQUENTIAL START TO PREVENT AUTH_KEY ERRORS
         for i, token in enumerate(BOT_TOKENS):
             device = random.choice(DEVICE_MODELS)
-            c = TelegramClient(f'bot_{i}', TG_API_ID, TG_API_HASH, device_model=device[0])
-            await c.start(bot_token=token)
-            clients.append(c)
-            print(f"✅ Bot {i} Online ({device[0]})")
-            await asyncio.sleep(2)
+            # Use distinct session names and aggressive connection retries
+            c = TelegramClient(
+                f'swarm_bot_{i}_{int(time.time())}', 
+                TG_API_ID, TG_API_HASH, 
+                device_model=device[0],
+                connection_retries=15,
+                retry_delay=3
+            )
+            
+            # Initial jitter before connecting to avoid "invalid nonce" collision
+            await asyncio.sleep(random.uniform(1.0, 5.0))
+            
+            try:
+                await c.start(bot_token=token)
+                clients.append(c)
+                print(f"✅ Bot {i} Online ({device[0]})")
+                # Wait for the session to be fully established before next one
+                await asyncio.sleep(4) 
+            except Exception as e:
+                print(f"⚠️ Bot {i} Auth Failed: {e}")
+
+        if not clients:
+            raise Exception("No bots were able to connect.")
 
         parts = [p for p in link.strip('/').split('/') if p]
         msg_id, chat_id = int(parts[-1]), int(f"-100{parts[parts.index('c')+1]}")
@@ -124,12 +144,14 @@ async def multi_bot_download(link, file_path):
         os.close(fd)
         print("✅ Download Finished.")
     finally:
-        for c in clients: await c.disconnect()
+        for c in clients: 
+            try: await c.disconnect()
+            except: pass
 
 def process_video_advanced(input_path):
     output = "ready.mp4"
     print(f"🎬 [FFMPEG] Remuxing...")
-    # Improved flags for YouTube compatibility
+    # Use -map 0 to ensure all stream references are preserved for YouTube ingest
     cmd = f"ffmpeg -i '{input_path}' -c copy -map 0 -movflags +faststart -y '{output}'"
     run_command(cmd)
     return output if os.path.exists(output) else input_path
@@ -146,7 +168,7 @@ def upload_to_youtube(path):
         )
         creds.refresh(Request())
         youtube = build('youtube', 'v3', credentials=creds)
-        media = MediaFileUpload(path, chunksize=1024*1024*10, resumable=True)
+        media = MediaFileUpload(path, chunksize=1024*1024*15, resumable=True)
         request = youtube.videos().insert(
             part="snippet,status",
             body={'snippet': {'title': 'Swarm Upload', 'categoryId': '24'}, 'status': {'privacyStatus': 'private'}},
@@ -155,7 +177,7 @@ def upload_to_youtube(path):
         response = None
         while response is None:
             status, response = request.next_chunk()
-            if status: print(f" 📤 Upload: {int(status.progress() * 100)}%")
+            if status: print(f" 📤 Upload Progress: {int(status.progress() * 100)}%")
         print(f"✨ SUCCESS: https://youtu.be/{response['id']}")
     except Exception as e:
         print(f"❌ YouTube Error: {e}")
@@ -164,11 +186,14 @@ async def main():
     if len(sys.argv) < 2: return
     for link in sys.argv[1].split(','):
         raw = f"dl_{int(time.time())}.mkv"
-        await multi_bot_download(link, raw)
-        processed = process_video_advanced(raw)
-        upload_to_youtube(processed)
-        for f in [raw, processed]:
-            if os.path.exists(f): os.remove(f)
+        try:
+            await multi_bot_download(link, raw)
+            processed = process_video_advanced(raw)
+            upload_to_youtube(processed)
+            for f in [raw, processed]:
+                if os.path.exists(f): os.remove(f)
+        except Exception as e:
+            print(f"❌ Main Loop Error: {e}")
 
 if __name__ == '__main__':
     asyncio.run(main())
