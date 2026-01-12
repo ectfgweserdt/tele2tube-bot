@@ -16,8 +16,9 @@ except ImportError:
 # Search Engine API
 try:
     from py1337x import Py1337x
-    # We will initialize with a reliable mirror or rotate if needed
-    torrent_api = Py1337x(proxy='1337x.to') 
+    # Fixed: Removed 'proxy' keyword argument which caused the TypeError.
+    # We initialize without arguments and handle mirror switching in the search function.
+    torrent_api = Py1337x() 
 except ImportError:
     torrent_api = None
 
@@ -33,6 +34,7 @@ if not API_ID or not API_HASH:
 client = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
 # MIRRORS to rotate if primary fails
+# The library uses these to construct the base URL
 MIRRORS = ['1337x.to', '1337x.st', 'x1337x.ws', 'x1337x.eu', 'x1337x.se']
 
 # --- ROBUST SEARCH LOGIC ---
@@ -43,7 +45,8 @@ def get_search_results(query):
     for mirror in MIRRORS:
         try:
             print(f"🔍 [MIRROR] Trying {mirror} for: {query}")
-            torrent_api.proxy = mirror
+            # Update the mirror dynamically
+            torrent_api.baseUrl = f'https://{mirror}'
             
             # Step 1: Attempt High Quality Search
             search_query = query if "1080p" in query.lower() else f"{query} 1080p"
@@ -68,8 +71,8 @@ def get_search_results(query):
                 final_list = []
                 for item in sorted_items:
                     name_low = item['name'].lower()
-                    # Filter out CAM/TS
-                    if any(x in name_low for x in ["cam", "ts", "hdts", "tc", "hc"]):
+                    # Filter out CAM/TS/Low Quality
+                    if any(x in name_low for x in ["cam", "ts", "hdts", "tc", "hc", "telesync"]):
                         continue
                     final_list.append(item)
                     if len(final_list) >= 6: break # Max 6 buttons
@@ -90,7 +93,7 @@ async def start(event):
     await event.respond(
         "🎬 **Superior Movie/Series Uploader**\n\n"
         "Send me the name of a movie or series. I will search multiple mirrors to find the **best 1080p** content.\n\n"
-        "Status: **Multi-Mirror Engine Active** ✅"
+        "Status: **Multi-Mirror Engine Fixed** ✅"
     )
 
 @client.on(events.NewMessage)
@@ -114,8 +117,8 @@ async def handle_search(event):
 
     buttons = []
     for item in results:
-        # Extract ID safely from link or info
         try:
+            # Safely extract ID or Link
             t_id = item.get('torrentId') or item.get('link').split('/')[-2]
             display = f"📥 {item['name'][:35]}.. ({item['size']})"
             buttons.append([Button.inline(display, data=f"info_{t_id}")])
@@ -150,8 +153,12 @@ async def torrent_info(event):
 @client.on(events.CallbackQuery(data=re.compile(b"dl_(.*)")))
 async def start_download(event):
     t_id = event.data.decode().split('_')[1]
-    info = torrent_api.info(torrentId=t_id)
-    magnet = info['magnetLink']
+    try:
+        info = torrent_api.info(torrentId=t_id)
+        magnet = info['magnetLink']
+    except:
+        await event.answer("Could not retrieve magnet link.", alert=True)
+        return
     
     msg = await event.edit(f"⏳ **Joining Swarm...**\n`{info['name']}`")
     path = await run_p2p_download(magnet, msg)
@@ -164,12 +171,16 @@ async def start_download(event):
         await msg.edit(f"✅ **Done!** Final file: `{os.path.basename(final_file)}`")
 
 async def run_p2p_download(magnet, msg):
-    if not lt: return None
+    if not lt: 
+        await msg.edit("❌ Error: libtorrent not installed.")
+        return None
     ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
     params = lt.parse_magnet_uri(magnet)
     params.save_path = "./downloads"
     if not os.path.exists("./downloads"): os.makedirs("./downloads")
     handle = ses.add_torrent(params)
+    
+    await msg.edit("🔍 **Finding peers...**")
     while not handle.has_metadata(): await asyncio.sleep(1)
     
     last_update = 0
@@ -188,6 +199,7 @@ async def process_video_ffmpeg(path, msg):
         if files: actual_file = max(files, key=os.path.getsize)
 
     output = "final_upload.mp4"
+    # Superior 1080p encode
     cmd = ["ffmpeg", "-i", actual_file, "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-c:a", "aac", "-y", output]
     p = await asyncio.create_subprocess_exec(*cmd)
     await p.wait()
