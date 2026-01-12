@@ -64,20 +64,10 @@ class SwarmTracker:
 async def bot_worker(bot_index, token, chat_id, msg_id, start, end, file_path, tracker):
     device = random.choice(DEVICE_MODELS)
     client = TelegramClient(f'bot_{bot_index}', TG_API_ID, TG_API_HASH, device_model=device[0])
+    fd = None
     try:
         await client.start(bot_token=token)
-        
-        # Internal progress callback
-        async def progress_callback(current, total):
-            await tracker.update(bot_index, current)
-
-        # Download specific range
-        # Note: end is the offset to stop at
         message = await client.get_messages(chat_id, ids=msg_id)
-        
-        # We use a custom downloader to handle ranges
-        # Telethon doesn't support 'offset' directly in download_media easily for bots,
-        # so we fallback to a more stable chunked downloader
         from telethon.tl.functions.upload import GetFileRequest
         
         fd = os.open(file_path, os.O_RDWR)
@@ -86,37 +76,44 @@ async def bot_worker(bot_index, token, chat_id, msg_id, start, end, file_path, t
         
         while current_offset < end:
             limit = min(chunk_size, end - current_offset)
+            success = False
             for attempt in range(5):
                 try:
-                    result = await client(GetFileRequest(
+                    # Timeout the specific chunk request to prevent infinite hanging
+                    result = await asyncio.wait_for(client(GetFileRequest(
                         utils.get_input_location(message.media),
                         offset=current_offset,
                         limit=limit
-                    ))
+                    )), timeout=20)
+                    
                     if result and result.bytes:
                         os.pwrite(fd, result.bytes, current_offset)
                         current_offset += len(result.bytes)
                         await tracker.update(bot_index, current_offset - start)
+                        success = True
                         break
+                except asyncio.TimeoutError:
+                    print(f"⚠️ [Bot-{bot_index}] Chunk request timed out. Retrying...", flush=True)
                 except errors.FloodWaitError as e:
                     await asyncio.sleep(e.seconds)
-                except Exception:
+                except Exception as e:
                     await asyncio.sleep(2)
             
-            if current_offset >= end: break
+            if not success:
+                print(f"❌ [Bot-{bot_index}] Failed to fetch chunk at {current_offset}. Skipping.", flush=True)
+                break
 
-        os.close(fd)
     finally:
+        if fd is not None:
+            os.close(fd)
         await client.disconnect()
 
 async def multi_bot_download(link, file_path):
     print(f"🔥 [INIT] Initializing swarm with {len(BOT_TOKENS)} bots...", flush=True)
     
-    # Parse link
     parts = [p for p in link.strip('/').split('/') if p]
     msg_id, chat_id = int(parts[-1]), int(f"-100{parts[parts.index('c')+1]}")
     
-    # Use one client to get file info
     temp_client = TelegramClient('info_session', TG_API_ID, TG_API_HASH)
     await temp_client.start(bot_token=BOT_TOKENS[0])
     msg = await temp_client.get_messages(chat_id, ids=msg_id)
@@ -124,7 +121,6 @@ async def multi_bot_download(link, file_path):
     print(f"📂 File Found: {msg.file.name} ({file_size//1024//1024} MB)", flush=True)
     await temp_client.disconnect()
 
-    # Pre-allocate
     with open(file_path, "wb") as f:
         f.truncate(file_size)
     
@@ -136,18 +132,24 @@ async def multi_bot_download(link, file_path):
         start = i * seg
         end = min(file_size, (i + 1) * seg)
         tasks.append(bot_worker(i, token, chat_id, msg_id, start, end, file_path, tracker))
-        # Start bots slightly staggered to avoid IP spam
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1)
 
     print(f"🚀 [ACTION] Swarm download active...", flush=True)
-    await asyncio.gather(*tasks)
-    print("✅ Swarm Download Finished.", flush=True)
+    
+    # Heartbeat loop to keep logs alive
+    done, pending = await asyncio.wait(tasks, timeout=600) # 10 min hard limit for 27MB
+    
+    if pending:
+        print(f"⚠️ [WARNING] {len(pending)} bots hung. Forcing cleanup.", flush=True)
+        for p in pending:
+            p.cancel()
+            
+    print("✅ Swarm Download Cycle Finished.", flush=True)
 
 def process_video_advanced(input_path):
     output = "ready.mp4"
     print(f"🎬 [FFMPEG] Remuxing...", flush=True)
-    # Added -max_muxing_queue_size to prevent freezes during remux
-    cmd = f"ffmpeg -i '{input_path}' -c copy -map 0 -movflags +faststart -max_muxing_queue_size 1024 -y '{output}'"
+    cmd = f"ffmpeg -i '{input_path}' -c copy -map 0 -movflags +faststart -y '{output}'"
     subprocess.run(cmd, shell=True, capture_output=True)
     return output if os.path.exists(output) else input_path
 
