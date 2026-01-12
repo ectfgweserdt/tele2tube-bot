@@ -8,6 +8,8 @@ import re
 import requests
 import math
 from telethon import TelegramClient, errors, utils
+from telethon.tl.functions.upload import GetFileRequest
+from telethon.tl.types import InputFileLocation
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -29,7 +31,6 @@ GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 # 512KB is the absolute maximum chunk size Telegram allows.
 CHUNK_SIZE = 512 * 1024 
 # Spawning 40 concurrent workers to saturate bandwidth. 
-# Standard is usually 4-8. This is aggressive.
 CONCURRENT_WORKERS = 40 
 
 # Fetching API Keys
@@ -75,29 +76,25 @@ class ProgressTracker:
         sys.stdout.flush()
 
 async def download_chunk(client, location, offset, file_handle, semaphore, tracker, retries=5):
-    """Downloads a specific chunk with aggressive retries."""
+    """Downloads a specific chunk using raw GetFileRequest."""
     async with semaphore:
         for attempt in range(retries):
             try:
-                # Force 512KB chunk download
-                result = await client(
-                    requests=None # Not needed for direct call
+                # Use raw GetFileRequest to bypass high-level logic and force specific chunks
+                # This corresponds to the "dangerous" manual method
+                request = GetFileRequest(
+                    location=location,
+                    offset=offset,
+                    limit=CHUNK_SIZE
                 )
-                # Using client.download_file helper for raw bytes access
-                # We access the internal sender to request specific parts
-                chunk = await client.download_file(
-                    location, 
-                    offset=offset, 
-                    limit=CHUNK_SIZE, 
-                    part_size_kb=512
-                )
+                result = await client(request)
+                chunk = result.bytes
                 
                 if not chunk:
                     break # End of file
                 
-                # Seek and write is thread-safe in Python's GIL for atomic writes, 
-                # but we use a lock conceptually if needed. 
-                # Here, we trust OS file handles with offsets.
+                # Seek and write. In single-threaded asyncio (even with uvloop), 
+                # this is safe as long as we don't await *during* the seek/write pair.
                 file_handle.seek(offset)
                 file_handle.write(chunk)
                 tracker.update(len(chunk))
@@ -111,14 +108,14 @@ async def download_chunk(client, location, offset, file_handle, semaphore, track
 async def fast_download(client, message, file_path):
     """
     Aggressive Manual Parallel Downloader.
-    Bypasses standard helpers to force maximum concurrency.
     """
     print(f"🔥 INITIALIZING AGGRESSIVE DOWNLOADER: {CONCURRENT_WORKERS} threads")
     
     file_size = message.file.size
-    file_location = message.document
+    # Convert message media to InputFileLocation for GetFileRequest
+    input_location = utils.get_input_location(message.media)
     
-    # Pre-allocate file on disk to prevent fragmentation and lock issues
+    # Pre-allocate file on disk
     with open(file_path, "wb") as f:
         f.seek(file_size - 1)
         f.write(b"\0")
@@ -129,20 +126,22 @@ async def fast_download(client, message, file_path):
     
     tasks = []
     # Create tasks for every 512KB chunk
-    # We iterate offsets: 0, 512KB, 1024KB...
     for offset in range(0, file_size, CHUNK_SIZE):
         task = asyncio.create_task(
-            download_chunk(client, file_location, offset, f, semaphore, tracker)
+            download_chunk(client, input_location, offset, f, semaphore, tracker)
         )
         tasks.append(task)
     
     start_time = time.time()
     
     try:
-        # Run all chunks concurrently (limited by semaphore)
+        # Run all chunks concurrently. If one fails, we want to know.
         await asyncio.gather(*tasks)
     except Exception as e:
         print(f"\n⚠️ Critical Download Error: {e}")
+        f.close()
+        os.remove(file_path) # Delete corrupt file
+        raise e # Re-raise to stop processing
     finally:
         f.close()
         
@@ -199,16 +198,24 @@ async def get_metadata(filename):
 
 def process_video_advanced(input_path):
     print(f"🛠️  Step 1: Analyzing media streams...")
+    # Check if file is valid before ffprobe
+    if not os.path.exists(input_path) or os.path.getsize(input_path) < 1024:
+        raise Exception("Downloaded file is empty or too small.")
+
     probe_cmd = f"ffprobe -v quiet -print_format json -show_streams '{input_path}'"
     probe_out, _, _ = run_command(probe_cmd)
     
     try:
         probe_data = json.loads(probe_out)
     except json.JSONDecodeError:
-        # Fallback if ffprobe fails or file is empty
+        print("⚠️ FFprobe failed, uploading original file.")
         return input_path, None
 
     streams = probe_data.get('streams', [])
+    if not streams:
+        print("⚠️ No streams found, uploading original file.")
+        return input_path, None
+
     audio_streams = [s for s in streams if s['codec_type'] == 'audio']
     eng_track = next((i for i, s in enumerate(audio_streams) if s.get('tags', {}).get('language') in ['eng', 'en']), None)
     
@@ -216,7 +223,6 @@ def process_video_advanced(input_path):
     output_video = "processed_video.mp4"
     
     print(f"✂️  Step 2: Stripping extra audio & keeping English (Fast Stream Copy)...")
-    # Using -dn to disable data streams (covers, etc) which sometimes break outputs
     run_command(f"ffmpeg -i '{input_path}' -map 0:v:0 -map {audio_map} -c:v copy -c:a copy -dn -y '{output_video}'")
     
     print(f"📜 Step 3: Extracting and validating subtitles...")
@@ -225,9 +231,9 @@ def process_video_advanced(input_path):
     
     has_subs = os.path.exists(sub_file) and os.path.getsize(sub_file) > 100
     
-    # Return original if processing failed (size 0)
-    if os.path.exists(output_video) and os.path.getsize(output_video) > 100:
+    if os.path.exists(output_video) and os.path.getsize(output_video) > 1024:
         return output_video, (sub_file if has_subs else None)
+    
     return input_path, (sub_file if has_subs else None)
 
 def upload_to_youtube(video_path, metadata, sub_path):
@@ -299,6 +305,8 @@ async def process_link(client, link):
         message = await client.get_messages(chat_id, ids=msg_id)
         
         raw_file = f"temp_{msg_id}.mkv"
+        
+        # Will raise exception if download fails
         await fast_download(client, message, raw_file)
         
         metadata = await get_metadata(message.file.name or raw_file)
@@ -310,6 +318,9 @@ async def process_link(client, link):
             if f and os.path.exists(f): os.remove(f)
     except Exception as e:
         print(f"\n❌ Error processing link: {e}")
+        # Ensure cleanup on failure
+        if 'raw_file' in locals() and os.path.exists(raw_file):
+            os.remove(raw_file)
 
 async def main():
     if len(sys.argv) < 2: return
@@ -321,9 +332,9 @@ async def main():
         os.environ['TG_API_HASH'],
         request_retries=15,
         connection_retries=15,
-        retry_delay=1, # Decreased delay for aggression
+        retry_delay=1, 
         auto_reconnect=True,
-        flood_sleep_threshold=5 # Don't sleep for floods > 5s, let it error so we know
+        flood_sleep_threshold=5 
     )
     await client.start(bot_token=TG_BOT_TOKEN)
     for link in links:
