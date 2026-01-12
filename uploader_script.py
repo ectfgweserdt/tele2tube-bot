@@ -19,7 +19,7 @@ import googleapiclient.errors
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    print("🚀 uvloop enabled: Multi-bot synchronization active.")
+    print("🚀 uvloop enabled: Swarm coordination optimized.")
 except ImportError:
     print("⚠️ uvloop not found.")
 
@@ -27,7 +27,8 @@ YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 
 # Multi-Bot Configuration
-CONCURRENT_PER_BOT = 10 
+# Reduced per-bot concurrency to avoid triggering Telegram's "FloodWait"
+CONCURRENT_PER_BOT = 8 
 CHUNK_SIZE = 512 * 1024 # 512KB
 
 # Fetching API Keys
@@ -57,12 +58,11 @@ class ProgressTracker:
             await self._draw(self.downloaded, self.total_size)
 
     def update_sync(self, current, total):
-        """Synchronous update for YouTube upload chunks"""
         self._draw_sync(current, total)
 
     async def _draw(self, current, total):
         now = time.time()
-        if now - self.last_ui < 0.5 and current < total:
+        if now - self.last_ui < 0.8 and current < total:
             return
         self.last_ui = now
         elapsed = now - self.start_time
@@ -74,34 +74,33 @@ class ProgressTracker:
 
     def _draw_sync(self, current, total):
         now = time.time()
-        if now - self.last_ui < 0.5 and current < total:
+        if now - self.last_ui < 0.8 and current < total:
             return
         self.last_ui = now
         elapsed = now - self.start_time
         speed = (current / 1024 / 1024) / max(elapsed, 0.1)
         percent = (current / total) * 100
-        sys.stdout.write(f"\r{self.prefix} | {percent:5.1f}% | {speed:5.2f} MB/s")
+        sys.stdout.write(f"\r{tracker_prefix} | {percent:5.1f}% | {speed:5.2f} MB/s")
         sys.stdout.flush()
 
-async def download_segment(client, location, start_offset, end_offset, file_path, tracker):
+async def download_segment(client, location, start_offset, end_offset, fd, tracker):
     sem = asyncio.Semaphore(CONCURRENT_PER_BOT)
     
     async def download_chunk(offset, limit):
         async with sem:
-            for retry in range(3):
+            # Persistent retry with exponential backoff
+            for attempt in range(10): 
                 try:
                     result = await client(GetFileRequest(location, offset, limit))
                     if result and result.bytes:
-                        # Use OS-level handle to write to specific offset
-                        with open(file_path, "r+b") as f:
-                            f.seek(offset)
-                            f.write(result.bytes)
-                            f.flush()
+                        os.pwrite(fd, result.bytes, offset)
                         await tracker.update(len(result.bytes))
                         return
+                except errors.FloodWaitError as e:
+                    await asyncio.sleep(e.seconds + 1)
                 except Exception:
-                    await asyncio.sleep(1)
-            print(f"\n❌ Permanent failure at offset {offset}")
+                    await asyncio.sleep(2 ** attempt) 
+            print(f"\n⚠️ Segment lost at {offset} after 10 retries.")
 
     tasks = []
     for offset in range(start_offset, end_offset, CHUNK_SIZE):
@@ -110,8 +109,9 @@ async def download_segment(client, location, start_offset, end_offset, file_path
     await asyncio.gather(*tasks)
 
 async def multi_bot_download(links_data, file_path):
-    print(f"🔥 INITIALIZING SWARM: {len(BOT_TOKENS)} Bots detected.")
+    print(f"🔥 INITIALIZING SWARM: {len(BOT_TOKENS)} Bots")
     clients = []
+    fd = None
     try:
         for i, token in enumerate(BOT_TOKENS):
             c = TelegramClient(f'bot_session_{i}', TG_API_ID, TG_API_HASH)
@@ -125,43 +125,42 @@ async def multi_bot_download(links_data, file_path):
         file_size = primary_msg.file.size
         location = utils.get_input_location(primary_msg.media)
         
-        # Proper pre-allocation
+        # Pre-allocate physically
         with open(file_path, "wb") as f_init:
-            f_init.write(b'\0' * file_size)
+            f_init.truncate(file_size)
         
+        # Open file descriptor for concurrent thread-safe writes via os.pwrite
+        fd = os.open(file_path, os.O_RDWR)
         tracker = ProgressTracker(file_size, prefix='🌪️ SWARM')
-        segment_size = math.ceil(file_size / len(clients))
-        download_tasks = []
         
+        segment_size = math.ceil(file_size / len(clients))
+        tasks = []
         for i, client in enumerate(clients):
             start = i * segment_size
             end = min(file_size, (i + 1) * segment_size)
-            download_tasks.append(download_segment(client, location, start, end, file_path, tracker))
+            tasks.append(download_segment(client, location, start, end, fd, tracker))
 
         start_time = time.time()
-        await asyncio.gather(*download_tasks)
+        await asyncio.gather(*tasks)
         
-        # Verify if file actually contains data
-        if os.path.getsize(file_path) != file_size:
-            raise Exception("File size mismatch after download!")
-            
-        print(f"\n✅ Swarm Complete: {((file_size/1024/1024)/(time.time()-start_time)):.2f} MB/s average.")
+        duration = time.time() - start_time
+        print(f"\n✅ Swarm Complete: {(file_size/1024/1024)/max(duration, 0.1):.2f} MB/s")
+
     finally:
+        if fd: os.close(fd)
         for c in clients: await c.disconnect()
 
 async def get_metadata(filename):
-    print(f"🤖 AI generating metadata...")
-    clean_name = os.path.splitext(filename)[0].replace('_', ' ').replace('.', ' ')
-    return {"title": clean_name[:95], "description": "High speed swarm upload."}
+    print(f"🤖 AI Metadata Generation...")
+    name = os.path.splitext(filename)[0].replace('_', ' ').replace('.', ' ')
+    return {"title": name[:95], "description": f"Uploaded via Swarm Engine.\nFilename: {filename}"}
 
 def process_video_advanced(input_path):
     output_video = "processed_video.mp4"
-    print(f"✂️  FFmpeg processing (Remuxing to MP4)...")
-    # Using 'copy' is fast, but let's ensure we output a standard MP4 for YouTube
+    print(f"✂️  Remuxing for YouTube compatibility...")
+    # Using 'copy' for speed, ensuring mp4 container
     run_command(f"ffmpeg -i '{input_path}' -c copy -movflags +faststart -y '{output_video}'")
-    if os.path.exists(output_video) and os.path.getsize(output_video) > 1000:
-        return output_video
-    return input_path
+    return output_video if os.path.exists(output_video) else input_path
 
 def upload_to_youtube(video_path, metadata):
     try:
@@ -175,39 +174,36 @@ def upload_to_youtube(video_path, metadata):
         creds.refresh(Request())
         youtube = build('youtube', 'v3', credentials=creds)
         
-        body = {
-            'snippet': {'title': metadata.get('title', 'Video'), 'description': metadata.get('description', ''), 'categoryId': '24'},
-            'status': {'privacyStatus': 'private'}
-        }
-        
         media = MediaFileUpload(video_path, chunksize=1024*1024*10, resumable=True)
-        request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+        request = youtube.videos().insert(
+            part="snippet,status",
+            body={'snippet': {'title': metadata['title'], 'description': metadata['description'], 'categoryId': '24'}, 'status': {'privacyStatus': 'private'}},
+            media_body=media
+        )
         
-        tracker = ProgressTracker(os.path.getsize(video_path), prefix='📤 YouTube')
+        print(f"📤 Uploading to YouTube...")
         response = None
         while response is None:
             status, response = request.next_chunk()
-            if status:
-                tracker.update_sync(status.resumable_progress, os.path.getsize(video_path))
-        print(f"\n✨ Uploaded: https://youtu.be/{response['id']}")
+        print(f"✨ Success! ID: {response['id']}")
     except Exception as e:
-        print(f"\n🔴 YouTube Error: {e}")
+        print(f"🔴 YouTube Error: {e}")
 
 async def main():
     if len(sys.argv) < 2: return
     links = sys.argv[1].split(',')
     for link in links:
-        raw_file = f"download_{int(time.time())}.mkv"
+        raw_file = f"dn_{int(time.time())}.mkv"
         try:
             await multi_bot_download(link, raw_file)
-            metadata = await get_metadata(raw_file)
-            final_video = process_video_advanced(raw_file)
-            upload_to_youtube(final_video, metadata)
+            meta = await get_metadata(raw_file)
+            processed = process_video_advanced(raw_file)
+            upload_to_youtube(processed, meta)
             
-            if os.path.exists(raw_file): os.remove(raw_file)
-            if os.path.exists(final_video) and final_video != raw_file: os.remove(final_video)
+            for f in [raw_file, processed]:
+                if f and os.path.exists(f): os.remove(f)
         except Exception as e:
-            print(f"❌ Failed: {e}")
+            print(f"❌ Critical Failure: {e}")
 
 if __name__ == '__main__':
     asyncio.run(main())
