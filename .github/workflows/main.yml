@@ -8,7 +8,7 @@ on:
         required: true
         type: string
 
-# Ensure only one upload runs at a time to prevent IP conflicts
+# Ensure only one upload runs at a time to prevent IP/Rate-limit conflicts
 concurrency: 
   group: telegram-upload
   cancel-in-progress: false 
@@ -18,21 +18,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip' # Speed up workflow startup
-      - name: Install Tools
+          cache: 'pip'
+
+      - name: Install System dependencies
         run: |
           sudo apt-get update
-          # build-essential and python3-dev ensure uvloop/cryptg compile successfully if needed
-          sudo apt-get install -y ffmpeg build-essential python3-dev
-      - name: Install High-Speed Libraries
-        run: pip install -r requirements.txt
-      - name: Execute
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python Libraries
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute Swarm Uploader
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          # This should be token1,token2,token3 in your secrets
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
