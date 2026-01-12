@@ -1,20 +1,10 @@
-name: Fast Telegram to YouTube Bot
+name: Superior Movie Bot
 
 on:
-  workflow_dispatch:
-    inputs:
-      telegram_link:
-        description: 'Telegram Links (Comma separated)'
-        required: true
-        type: string
-
-# Ensure only one upload runs at a time to prevent IP/Rate-limit conflicts
-concurrency: 
-  group: telegram-upload
-  cancel-in-progress: false 
+  workflow_dispatch: # Manual trigger to start the bot
 
 jobs:
-  upload:
+  run-bot:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,27 +13,22 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
-      - name: Install System dependencies
+      - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg python3-libtorrent
 
       - name: Install Python Libraries
         run: |
-          pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Execute Swarm Uploader
+      - name: Start Interactive Bot
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
-          # This should be token1,token2,token3 in your secrets
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
-        run: python uploader_script.py "${{ github.event.inputs.telegram_link }}"
+        run: python uploader_script.py
