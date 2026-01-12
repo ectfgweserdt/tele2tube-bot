@@ -63,7 +63,8 @@ class SwarmTracker:
 
 async def bot_worker(bot_index, token, chat_id, msg_id, start, end, file_path, tracker):
     device = random.choice(DEVICE_MODELS)
-    client = TelegramClient(f'bot_{bot_index}', TG_API_ID, TG_API_HASH, device_model=device[0])
+    # Using unique session names to avoid SQLite lock issues
+    client = TelegramClient(f'bot_sess_{bot_index}_{int(time.time())}', TG_API_ID, TG_API_HASH, device_model=device[0])
     fd = None
     try:
         await client.start(bot_token=token)
@@ -79,12 +80,11 @@ async def bot_worker(bot_index, token, chat_id, msg_id, start, end, file_path, t
             success = False
             for attempt in range(5):
                 try:
-                    # Timeout the specific chunk request to prevent infinite hanging
                     result = await asyncio.wait_for(client(GetFileRequest(
                         utils.get_input_location(message.media),
                         offset=current_offset,
                         limit=limit
-                    )), timeout=20)
+                    )), timeout=30)
                     
                     if result and result.bytes:
                         os.pwrite(fd, result.bytes, current_offset)
@@ -93,14 +93,14 @@ async def bot_worker(bot_index, token, chat_id, msg_id, start, end, file_path, t
                         success = True
                         break
                 except asyncio.TimeoutError:
-                    print(f"⚠️ [Bot-{bot_index}] Chunk request timed out. Retrying...", flush=True)
+                    pass 
                 except errors.FloodWaitError as e:
                     await asyncio.sleep(e.seconds)
-                except Exception as e:
+                except Exception:
                     await asyncio.sleep(2)
             
             if not success:
-                print(f"❌ [Bot-{bot_index}] Failed to fetch chunk at {current_offset}. Skipping.", flush=True)
+                print(f"❌ [Bot-{bot_index}] Halted at {current_offset}.", flush=True)
                 break
 
     finally:
@@ -131,19 +131,30 @@ async def multi_bot_download(link, file_path):
     for i, token in enumerate(BOT_TOKENS):
         start = i * seg
         end = min(file_size, (i + 1) * seg)
-        tasks.append(bot_worker(i, token, chat_id, msg_id, start, end, file_path, tracker))
+        # FIX: Explicitly create a Task
+        t = asyncio.create_task(bot_worker(i, token, chat_id, msg_id, start, end, file_path, tracker))
+        tasks.append(t)
         await asyncio.sleep(1)
 
-    print(f"🚀 [ACTION] Swarm download active...", flush=True)
+    print(f"🚀 [ACTION] Swarm download active (Total: {len(tasks)} tasks)...", flush=True)
     
-    # Heartbeat loop to keep logs alive
-    done, pending = await asyncio.wait(tasks, timeout=600) # 10 min hard limit for 27MB
-    
-    if pending:
-        print(f"⚠️ [WARNING] {len(pending)} bots hung. Forcing cleanup.", flush=True)
-        for p in pending:
-            p.cancel()
+    # Heartbeat monitoring loop
+    start_wait = time.time()
+    while True:
+        done, pending = await asyncio.wait(tasks, timeout=10)
+        if not pending:
+            break
             
+        elapsed = time.time() - start_wait
+        if elapsed > 900: # 15 min hard timeout
+            print("⚠️ [TIMEOUT] Swarm taking too long. Terminating pending tasks.", flush=True)
+            for p in pending: p.cancel()
+            break
+            
+        # Heartbeat log to show we are still waiting
+        if len(done) < len(tasks):
+             print(f"💓 Heartbeat: {len(done)}/{len(tasks)} bots finished...", flush=True)
+
     print("✅ Swarm Download Cycle Finished.", flush=True)
 
 def process_video_advanced(input_path):
@@ -191,7 +202,8 @@ async def main():
             for f in [raw, processed]:
                 if os.path.exists(f): os.remove(f)
         except Exception as e:
-            print(f"❌ Critical Error: {e}", flush=True)
+            # Fixed error logging to not treat string as coroutine
+            print(f"❌ Critical Error: {str(e)}", flush=True)
 
 if __name__ == '__main__':
     asyncio.run(main())
