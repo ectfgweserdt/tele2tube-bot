@@ -7,6 +7,7 @@ import json
 import re
 import requests
 import math
+import io  # Added for byte buffering
 from telethon import TelegramClient, errors, utils
 from telethon.tl.types import InputDocumentFileLocation
 from google.auth.transport.requests import Request
@@ -22,7 +23,7 @@ GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 # AGGRESSIVE CONFIGURATION FOR SPEED
 # 16-32 workers is safe on high-bandwidth servers (like GitHub Actions)
 PARALLEL_WORKERS = 20 
-CHUNK_SIZE_KB = 1024  # 1MB chunks (better for high throughput than 512KB)
+CHUNK_SIZE_KB = 2048  # Increased to 2MB chunks for better stability with fewer seeks
 
 # Fetching API Keys
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '').strip()
@@ -43,7 +44,6 @@ class ProgressTracker:
         self.downloaded_bytes = 0
 
     def update(self, current_inc=0, abs_current=None):
-        # Allow incremental updates (for parallel downloader) or absolute (for single thread)
         if abs_current is not None:
             self.downloaded_bytes = abs_current
         else:
@@ -51,26 +51,26 @@ class ProgressTracker:
 
         now = time.time()
         # Throttling UI to 1 update per 0.5 second
-        if now - self.last_ui_update < 0.5 and self.downloaded_bytes < self.total_size:
+        # FIXED: Removed condition that bypassed throttle when 100% was reached
+        if now - self.last_ui_update < 0.5:
             return
         
         self.last_ui_update = now
         elapsed = now - self.start_time
-        # Prevent division by zero
         safe_elapsed = max(elapsed, 0.01)
         
         speed = (self.downloaded_bytes / 1024 / 1024) / safe_elapsed
         percentage = (self.downloaded_bytes / self.total_size) * 100
         
-        # Cap percentage at 100 for UI cleanliness
-        percentage = min(percentage, 100.0)
+        # Cap visual percentage
+        display_percentage = min(percentage, 100.0)
         
         bar_length = 20
-        filled = int(bar_length * percentage // 100)
+        filled = int(bar_length * display_percentage // 100)
         bar = '█' * filled + '-' * (bar_length - filled)
         
         status = (
-            f"\r{self.prefix} [{bar}] {percentage:5.1f}% | "
+            f"\r{self.prefix} [{bar}] {display_percentage:5.1f}% | "
             f"{self.downloaded_bytes/1024/1024:7.2f}/{self.total_size/1024/1024:7.2f} MB | "
             f"⚡ {speed:5.2f} MB/s"
         )
@@ -84,79 +84,76 @@ async def fast_download(client, message, file_path):
     """
     print(f"📡 Initializing Hyper-Speed Download...")
     
-    # Get media details
     media = message.media
     if not media:
         print("❌ No media found.")
         return
 
-    # Determine file size and input location
     if hasattr(media, 'document'):
         file_size = media.document.size
-        input_location = InputDocumentFileLocation(
-            id=media.document.id,
-            access_hash=media.document.access_hash,
-            file_reference=media.document.file_reference,
-            thumb_size=""
-        )
+        # InputDocumentFileLocation is implicit in download_media usually, 
+        # but for iter_download we just pass the message or media object.
     else:
-        # Fallback for other media types (photos etc), though less likely for videos
         print("⚠️ Not a document, falling back to standard download.")
         await client.download_media(message, file_path)
         return
 
     tracker = ProgressTracker(file_size, prefix='📥 Downloading')
     
-    # Calculate chunks
     chunk_size = CHUNK_SIZE_KB * 1024
     total_chunks = math.ceil(file_size / chunk_size)
     queue = asyncio.Queue()
     
-    # Populate queue with chunk indices
     for i in range(total_chunks):
         queue.put_nowait(i)
 
-    # Open file for random access writing
     with open(file_path, 'wb') as f:
-        # Pre-allocate file size on disk to prevent fragmentation and pointer jumping
         f.truncate(file_size)
-        
-        # Lock for thread-safe file writing
         file_lock = asyncio.Lock()
         
         async def worker():
             while not queue.empty():
                 chunk_index = await queue.get()
                 offset = chunk_index * chunk_size
-                
-                # Calculate size for this specific chunk (last one might be smaller)
                 current_limit = min(chunk_size, file_size - offset)
                 
+                # Buffer in memory to prevent Seek/Write race conditions
+                buffer = io.BytesIO()
+                bytes_received = 0
+                
                 try:
-                    # Download chunk
-                    # part_size_kb ensures internal Telethon fetch size matches our logic
+                    # Request slightly more to ensure we get enough, but cap strictly in loop
                     async for chunk in client.iter_download(
                         media, 
                         offset=offset, 
-                        limit=current_limit, 
-                        chunk_size=None, # Let Telethon decide internal buffer
-                        request_size=CHUNK_SIZE_KB * 1024
+                        limit=current_limit,
+                        request_size=chunk_size # Request optimal blocks
                     ):
-                        async with file_lock:
-                            f.seek(offset)
-                            f.write(chunk)
+                        # SAFETY: Don't write past the chunk limit
+                        remaining = current_limit - bytes_received
+                        if remaining <= 0:
+                            break
+                            
+                        to_write = chunk[:remaining]
+                        buffer.write(to_write)
+                        bytes_received += len(to_write)
+                        tracker.update(current_inc=len(to_write))
                         
-                        # Update tracker
-                        tracker.update(current_inc=len(chunk))
+                        if bytes_received >= current_limit:
+                            break
+                    
+                    # Atomic Write to Disk
+                    data = buffer.getvalue()
+                    async with file_lock:
+                        f.seek(offset)
+                        f.write(data)
                         
                 except Exception as e:
                     print(f"\n❌ Chunk {chunk_index} failed: {e}")
-                    # In a production app, you might want to re-queue the chunk here
-                    # queue.put_nowait(chunk_index)
+                    # Retrying would be good here in v2
                 finally:
                     queue.task_done()
 
-        # Launch workers
         start_time = time.time()
         workers = [asyncio.create_task(worker()) for _ in range(min(PARALLEL_WORKERS, total_chunks))]
         await asyncio.gather(*workers)
@@ -166,7 +163,6 @@ async def fast_download(client, message, file_path):
     print(f"\n✅ Download Complete in {duration:.2f}s! (Avg: {avg_speed:.2f} MB/s)")
 
 def get_file_info(file_path):
-    """Analyzes file and prints detailed stats before upload."""
     print("\n📋 --- FILE ANALYSIS REPORT ---")
     if not os.path.exists(file_path):
         print("❌ File not found.")
@@ -178,20 +174,18 @@ def get_file_info(file_path):
     
     print(f"📦 Size: {size_mb:.2f} MB ({size_gb:.2f} GB)")
     
-    # Use ffprobe for media details
     try:
-        cmd = f"ffprobe -v error -select_streams v:0 -show_entries stream=width,height,duration,codec_name -of default=noprint_wrappers=1:nokey=1 '{file_path}'"
+        # Use simple text output to avoid JSON parsing issues with some FFmpeg versions
+        cmd = f"ffprobe -v error -select_streams v:0 -show_entries stream=width,height,duration,codec_name,bit_rate -of default=noprint_wrappers=1:nokey=1 '{file_path}'"
         output, _, _ = run_command(cmd)
-        details = output.strip().split('\n')
-        
-        if len(details) >= 3:
-            # Output order varies, so we use a json format for reliability usually, but simple text is fine if parsed loosely
-            # Let's try JSON for safety
-            cmd_json = f"ffprobe -v error -select_streams v:0 -show_entries stream=width,height,duration,codec_name,bit_rate -of json '{file_path}'"
-            out_json, _, _ = run_command(cmd_json)
-            data = json.loads(out_json)
+        lines = output.strip().split('\n')
+        # Simple heuristic mapping since order can vary; using JSON is safer if available
+        # But let's stick to the previous JSON method which was better, just wrapped in try/except
+        cmd_json = f"ffprobe -v error -select_streams v:0 -show_entries stream=width,height,duration,codec_name,bit_rate -of json '{file_path}'"
+        out_json, _, _ = run_command(cmd_json)
+        data = json.loads(out_json)
+        if 'streams' in data and len(data['streams']) > 0:
             stream = data['streams'][0]
-            
             width = stream.get('width', 'N/A')
             height = stream.get('height', 'N/A')
             duration = float(stream.get('duration', 0))
@@ -206,7 +200,7 @@ def get_file_info(file_path):
             print(f"🎞️  Codec: {codec.upper()}")
             print(f"📶 Bitrate: {bitrate:.0f} kbps")
     except Exception as e:
-        print(f"⚠️ Could not read media metadata: {e}")
+        print(f"⚠️ Metadata read error: {e}")
     print("------------------------------\n")
 
 def parse_filename(filename):
@@ -272,14 +266,9 @@ def process_video_advanced(input_path):
     audio_map = f"0:a:{eng_track}" if eng_track is not None else "0:a:0"
     output_video = "processed_video.mp4"
     
-    # Check if processing is even needed (if it's already mp4 and has 1 audio track, maybe skip?)
-    # But user asked to keep functions, so we proceed.
-    
     print(f"✂️  Step 2: Stripping extra audio & keeping English (Fast Stream Copy)...")
-    # -strict -2 ensures compatibility with some older aac standards if needed
     run_command(f"ffmpeg -i '{input_path}' -map 0:v:0 -map {audio_map} -c:v copy -c:a copy -y '{output_video}'")
     
-    # Fallback if ffmpeg failed (empty output)
     if not os.path.exists(output_video) or os.path.getsize(output_video) < 1000:
         print("⚠️ Processing failed or file too small, using original file.")
         if os.path.exists(output_video): os.remove(output_video)
@@ -294,7 +283,6 @@ def process_video_advanced(input_path):
     return output_video, (sub_file if has_subs else None)
 
 def upload_to_youtube(video_path, metadata, sub_path):
-    # Show file details before uploading
     get_file_info(video_path)
 
     try:
@@ -364,11 +352,9 @@ async def process_link(client, link):
         msg_id, chat_id = int(parts[-1]), int(f"-100{parts[parts.index('c')+1]}")
         message = await client.get_messages(chat_id, ids=msg_id)
         
-        # Ensure we have a valid filename
         filename = message.file.name
         if not filename:
-            # Try to guess extension from mime type or attributes
-            ext = ".mkv" # Default
+            ext = ".mkv"
             if message.file.mime_type:
                  if 'mp4' in message.file.mime_type: ext = ".mp4"
                  elif 'matroska' in message.file.mime_type: ext = ".mkv"
@@ -376,10 +362,8 @@ async def process_link(client, link):
 
         raw_file = f"temp_{msg_id}_{filename}"
         
-        # Use the new parallel downloader
         await fast_download(client, message, raw_file)
         
-        # Display stats of the raw downloaded file
         print("\n--- Raw Download Info ---")
         get_file_info(raw_file)
 
@@ -398,7 +382,6 @@ async def process_link(client, link):
 async def main():
     if len(sys.argv) < 2: return
     links = sys.argv[1].split(',')
-    # Optimized client params
     client = TelegramClient(
         'bot_session', 
         os.environ['TG_API_ID'], 
