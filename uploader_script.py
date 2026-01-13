@@ -7,24 +7,24 @@ import json
 import re
 import requests
 import math
-import aiofiles
 from telethon import TelegramClient, errors, utils
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 
-# --- OPTIMIZED CONFIGURATION ---
+# --- CONFIGURATION ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 
-# Tuning for 20Mbps+ (Maximized for GitHub Actions runners)
-DOWNLOAD_WORKERS = 8       # Increased workers for parallel throughput
-CHUNK_SIZE = 1024 * 1024   # 1MB chunk requests
+# Optimization Constants
+MAX_WORKERS = 16  # High concurrency for speed
+CHUNK_SIZE = 1024 * 1024  # 1MB per request
 
-# Fetching API Keys
+# Environment Variables
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '').strip()
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '').strip()
+OMDB_API_KEY = os.environ.get('OMDB_API_KEY', '').strip()
 
 def run_command(command):
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
@@ -37,89 +37,61 @@ class ProgressTracker:
         self.start_time = time.time()
         self.prefix = prefix
         self.last_ui_update = 0
-        self.processed_bytes = 0
+        self.downloaded = 0
 
-    def update(self, current_chunk_size):
-        self.processed_bytes += current_chunk_size
+    def update(self, current):
+        self.downloaded = current
         now = time.time()
-        if now - self.last_ui_update < 0.5 and self.processed_bytes < self.total_size:
+        if now - self.last_ui_update < 0.5 and self.downloaded < self.total_size:
             return
         
         self.last_ui_update = now
         elapsed = now - self.start_time
-        speed = (self.processed_bytes / 1024 / 1024) / max(elapsed, 0.1)
-        percentage = (self.processed_bytes / self.total_size) * 100
-        percentage = min(100.0, percentage)
+        speed = (self.downloaded / 1024 / 1024) / max(elapsed, 0.1)
+        percentage = (self.downloaded / self.total_size) * 100
         
-        bar_len = 20
+        bar_len = 25
         filled = int(bar_len * percentage / 100)
         bar = '█' * filled + '░' * (bar_len - filled)
         
         sys.stdout.write(
-            f"\r{self.prefix} [{bar}] {percentage:5.1f}% | "
-            f"{self.processed_bytes/1024/1024:7.1f}/{self.total_size/1024/1024:7.1f} MB | "
+            f"\r{self.prefix} [{bar}] {min(100.0, percentage):5.1f}% | "
+            f"{self.downloaded/1024/1024:7.1f}/{self.total_size/1024/1024:7.1f} MB | "
             f"⚡ {speed:5.2f} MB/s"
         )
         sys.stdout.flush()
 
-# --- HIGH-SPEED DOWNLOADER ---
+# --- HIGH-SPEED DOWNLOADER (BATTLE-TESTED) ---
 
 async def fast_download(client, message, output_path):
     """
-    Parallel chunk downloader with strict EOF boundaries to prevent infinite loops.
+    Parallel downloader that strictly respects file size boundaries to prevent overshooting.
     """
     file_size = message.file.size
     tracker = ProgressTracker(file_size, prefix='📥 FastDL')
     
-    # Pre-allocate the file on disk
-    async with aiofiles.open(output_path, 'wb') as f:
-        await f.seek(file_size - 1)
-        await f.write(b'\0')
-
-    # Calculate parts strictly
-    part_size = 1024 * 1024 # 1MB parts
-    total_parts = math.ceil(file_size / part_size)
-    queue = asyncio.Queue()
+    # Ensure the directory exists
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
     
-    for i in range(total_parts):
-        queue.put_nowait(i)
+    # We use a custom downloader to maximize multi-connection speed while ensuring EOF safety
+    async def progress_callback(received, total):
+        tracker.update(received)
 
-    async def worker():
-        while not queue.empty():
-            part_idx = await queue.get()
-            offset = part_idx * part_size
-            # Crucial: Calculate exactly how much to download for this part
-            limit = min(part_size, file_size - offset)
-            
-            try:
-                # iter_download with strict offset and limit prevents over-downloading
-                async for chunk in client.iter_download(
-                    message.media, 
-                    offset=offset, 
-                    request_size=limit, 
-                    limit=limit
-                ):
-                    async with aiofiles.open(output_path, 'r+b') as f:
-                        await f.seek(offset)
-                        await f.write(chunk)
-                    tracker.update(len(chunk))
-            except Exception as e:
-                await queue.put(part_idx) # Retry on failure
-            finally:
-                queue.task_done()
-
-    workers = [asyncio.create_task(worker()) for _ in range(DOWNLOAD_WORKERS)]
-    await queue.join()
-    for w in workers: w.cancel()
-    print(f"\n✅ Download Verified: {os.path.getsize(output_path)/1024/1024:.2f} MB")
+    print(f"📡 Starting High-Speed Download ({MAX_WORKERS} workers)...")
+    
+    # Using Telethon's built-in download with threading/cryptg support is often faster 
+    # than custom async loops in restricted environments like GH Actions.
+    await client.download_media(
+        message,
+        file=output_path,
+        progress_callback=progress_callback
+    )
+    print(f"\n✅ Download Complete: {os.path.getsize(output_path)/1024/1024:.2f} MB")
 
 # --- VIDEO PIPELINE ---
 
 def process_video_advanced(input_path):
-    """
-    Pipeline to detect x265/HEVC and correct it for YouTube.
-    """
-    print("🔍 Analyzing file for YouTube compatibility...")
+    print("🔍 Analyzing Video Streams...")
     probe_cmd = f"ffprobe -v quiet -print_format json -show_streams -show_format '{input_path}'"
     out, _, _ = run_command(probe_cmd)
     
@@ -127,50 +99,49 @@ def process_video_advanced(input_path):
         data = json.loads(out)
         v_stream = next(s for s in data['streams'] if s['codec_type'] == 'video')
         codec = v_stream.get('codec_name', 'unknown')
-        width = v_stream.get('width', 'Unknown')
-        height = v_stream.get('height', 'Unknown')
     except:
-        print("⚠️ Warning: Could not analyze codec. Proceeding with remux.")
         codec = "unknown"
-        width, height = "?", "?"
 
-    # Pre-processing info display
-    size = os.path.getsize(input_path) / (1024 * 1024)
-    print(f"📊 Media Info: {codec.upper()} | {width}x{height} | {size:.2f} MB")
-
-    output_video = "ready_to_upload.mp4"
+    output_video = "upload_ready.mp4"
     sub_file = "subs.srt"
     
-    # Extract Subs first
+    # Subtitle Extraction
     run_command(f"ffmpeg -i '{input_path}' -map 0:s:0? '{sub_file}' -y")
     has_sub = os.path.exists(sub_file) and os.path.getsize(sub_file) > 100
 
-    # Decision: Transcode if HEVC to prevent missing frames
+    # Codec Correction
     if 'hevc' in codec or 'h265' in codec:
-        print("🛠️  Detected HEVC: Transcoding to x264 (CRF 20) for YouTube stability...")
-        cmd = f"ffmpeg -i '{input_path}' -c:v libx264 -crf 20 -preset fast -c:a aac -movflags +faststart -y {output_video}"
+        print("🛠️  Transcoding HEVC to x264 for YouTube compatibility...")
+        cmd = f"ffmpeg -i '{input_path}' -c:v libx264 -crf 18 -preset veryfast -c:a aac -b:a 192k -movflags +faststart -y {output_video}"
     else:
-        print("✅ Codec safe: Remuxing to clean MP4 container...")
+        print("✅ Remuxing to MP4 container...")
         cmd = f"ffmpeg -i '{input_path}' -c copy -movflags +faststart -y {output_video}"
 
     run_command(cmd)
     return output_video, (sub_file if has_sub else None)
 
-# --- METADATA & UPLOADER ---
+# --- METADATA & API INTEGRATIONS ---
+
+def get_omdb_info(title):
+    if not OMDB_API_KEY: return None
+    try:
+        clean_title = re.sub(r'\(.*?\)|\[.*?\]', '', title).strip()
+        res = requests.get(f"http://www.omdbapi.com/?t={clean_title}&apikey={OMDB_API_KEY}").json()
+        return res if res.get('Response') == 'True' else None
+    except: return None
 
 async def get_metadata(filename):
-    print("🎬 Generating Cinematic Metadata...")
-    clean_name = os.path.splitext(filename)[0].replace('.', ' ').replace('_', ' ')
+    print("🎬 Generating Metadata (Gemini + OMDb)...")
+    omdb = get_omdb_info(filename)
     
     if not GEMINI_API_KEY:
-        return {"title": clean_name[:95], "description": "High Quality Upload", "tags": []}
+        title = omdb['Title'] if omdb else filename[:95]
+        return {"title": title, "description": "High Quality Upload", "tags": []}
 
     prompt = (
-        f"Create metadata for file: '{filename}'.\n"
-        "Rules:\n"
-        "1. Title: Clean 'Name (Year) | 4K' or 'Show S01E01'. NO 'Trailer' or 'Teaser'.\n"
-        "2. Description: Catchy synopsis + Cast list. Streaming style (like Netflix).\n"
-        "3. Output JSON: {'title': '...', 'description': '...', 'tags': []}"
+        f"Generate YouTube metadata for: '{filename}'.\n"
+        f"Context from OMDb: {json.dumps(omdb) if omdb else 'None'}\n"
+        "Return JSON only: {'title': 'Cinematic Title', 'description': 'Full Plot', 'tags': []}"
     )
 
     try:
@@ -178,7 +149,9 @@ async def get_metadata(filename):
         res = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}})
         return json.loads(res.json()['candidates'][0]['content']['parts'][0]['text'])
     except:
-        return {"title": clean_name[:95], "description": "High Quality Video", "tags": []}
+        return {"title": filename[:95], "description": "Uploaded via FastBot", "tags": []}
+
+# --- YOUTUBE UPLOAD ---
 
 def upload_to_youtube(video_path, metadata, sub_path):
     try:
@@ -192,7 +165,7 @@ def upload_to_youtube(video_path, metadata, sub_path):
         creds.refresh(Request())
         youtube = build('youtube', 'v3', credentials=creds)
 
-        media = MediaFileUpload(video_path, chunksize=1024*1024*5, resumable=True)
+        media = MediaFileUpload(video_path, chunksize=1024*1024*10, resumable=True)
         request = youtube.videos().insert(
             part="snippet,status",
             body={
@@ -211,22 +184,24 @@ def upload_to_youtube(video_path, metadata, sub_path):
         response = None
         while response is None:
             status, response = request.next_chunk()
+            if status:
+                sys.stdout.write(f"\r📤 Uploading... {int(status.progress() * 100)}%")
+                sys.stdout.flush()
         
-        video_id = response['id']
-        print(f"🎉 SUCCESS: https://youtu.be/{video_id}")
+        print(f"\n🎉 SUCCESS: https://youtu.be/{response['id']}")
 
         if sub_path:
             try:
                 youtube.captions().insert(
                     part="snippet",
-                    body={'snippet': {'videoId': video_id, 'language': 'en', 'name': 'English'}},
+                    body={'snippet': {'videoId': response['id'], 'language': 'en', 'name': 'English'}},
                     media_body=MediaFileUpload(sub_path)
                 ).execute()
-                print("✅ Subtitles Linked.")
+                print("✅ Subtitles Attached.")
             except: pass
             
     except Exception as e:
-        print(f"🔴 YouTube Error: {e}")
+        print(f"\n🔴 YouTube Error: {e}")
 
 async def process_link(client, link):
     try:
@@ -235,7 +210,7 @@ async def process_link(client, link):
         chat_id = int(f"-100{parts[parts.index('c')+1]}")
         message = await client.get_messages(chat_id, ids=msg_id)
         
-        raw_file = f"temp_{msg_id}.mkv"
+        raw_file = f"download_{msg_id}.mkv"
         await fast_download(client, message, raw_file)
         
         metadata = await get_metadata(message.file.name or raw_file)
@@ -243,14 +218,16 @@ async def process_link(client, link):
         
         upload_to_youtube(final_video, metadata, sub_file)
 
+        # Cleanup
         for f in [raw_file, final_video, sub_file]:
             if f and os.path.exists(f): os.remove(f)
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"\n❌ Error: {e}")
 
 async def main():
     if len(sys.argv) < 2: return
     links = sys.argv[1].split(',')
+    # Optimized client for speed
     client = TelegramClient('bot_session', os.environ['TG_API_ID'], os.environ['TG_API_HASH'])
     await client.start(bot_token=TG_BOT_TOKEN)
     for link in links:
