@@ -16,12 +16,12 @@ from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 import googleapiclient.errors
 
-# --- EXTREME SPEED CONFIGURATION ---
+# --- PERFORMANCE TUNING ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 
-# Maximum Parallelism for GitHub Runners (Network Optimized)
-PARALLEL_WORKERS = 32  
+# 16 is the "Sweet Spot" for GitHub Actions to avoid CPU bottlenecking
+PARALLEL_WORKERS = 20 
 CHUNK_SIZE_KB = 1024   
 
 # Fetching API Keys
@@ -73,13 +73,13 @@ class ProgressTracker:
         sys.stdout.flush()
 
 async def fast_download(client, message, file_path):
-    print(f"📡 Initializing Hyper-Speed Engine (Workers: {PARALLEL_WORKERS})...")
+    print(f"📡 High-Speed Engine (Workers: {PARALLEL_WORKERS} | Chunk: {CHUNK_SIZE_KB}KB)...")
     
     try:
         import cryptg
-        print("⚡ Cryptg detected: Decryption acceleration active.")
+        print("⚡ Cryptg active: Hardware-accelerated decryption.")
     except ImportError:
-        print("⚠️ Cryptg NOT detected: CPU limited.")
+        print("⚠️ Warning: Cryptg missing. Speeds will be limited by CPU.")
 
     media = message.media
     if not media or not hasattr(media, 'document'):
@@ -95,6 +95,7 @@ async def fast_download(client, message, file_path):
     queue = asyncio.Queue()
     for i in range(total_chunks): queue.put_nowait(i)
 
+    # Pre-allocate file to prevent fragmentation slowdowns
     with open(file_path, 'wb') as f:
         f.truncate(file_size)
         file_lock = asyncio.Lock()
@@ -109,23 +110,20 @@ async def fast_download(client, message, file_path):
                 offset = chunk_index * chunk_size
                 current_limit = min(chunk_size, file_size - offset)
                 
-                buffer = io.BytesIO()
-                bytes_received = 0
                 try:
-                    async for chunk in client.iter_download(media, offset=offset, limit=current_limit, request_size=chunk_size):
-                        remaining = current_limit - bytes_received
-                        if remaining <= 0: break
-                        to_write = chunk[:remaining]
-                        buffer.write(to_write)
-                        bytes_received += len(to_write)
-                        tracker.update(current_inc=len(to_write))
-                    
-                    data = buffer.getvalue()
-                    async with file_lock:
-                        f.seek(offset)
-                        f.write(data)
+                    # Optimized iter_download call
+                    async for chunk in client.iter_download(
+                        media, 
+                        offset=offset, 
+                        limit=current_limit, 
+                        request_size=chunk_size
+                    ):
+                        async with file_lock:
+                            f.seek(offset)
+                            f.write(chunk)
+                        tracker.update(current_inc=len(chunk))
                 except Exception:
-                    await queue.put(chunk_index)
+                    await queue.put(chunk_index) # Silent retry
                 finally:
                     queue.task_done()
 
@@ -134,8 +132,7 @@ async def fast_download(client, message, file_path):
         await asyncio.gather(*worker_tasks)
         
     duration = time.time() - start_time
-    print(f"\n✅ Finished! Average Speed: {(file_size/1024/1024)/duration:.2f} MB/s")
-    time.sleep(0.5)
+    print(f"\n✅ Download Finished! Avg Speed: {(file_size/1024/1024)/duration:.2f} MB/s")
 
 def get_video_codec(file_path):
     cmd = f"ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 '{file_path}'"
@@ -143,24 +140,18 @@ def get_video_codec(file_path):
     return output.strip().lower()
 
 async def get_metadata(filename):
-    print(f"🤖 AI is crafting cinematic metadata (CLEAN TITLE MODE)...")
+    print(f"🤖 AI Metadata: Clean Title Mode...")
     clean_name = os.path.splitext(filename)[0].replace('_', ' ').replace('.', ' ')
     
     if GEMINI_API_KEY:
         gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        
         system_instruction = (
-            "You are a professional YouTube metadata expert. "
-            "IMPORTANT RULES for TITLE:\n"
-            "1. NO 'Trailer', 'Teaser', 'Clip', 'Official', or 'Promo' words.\n"
-            "2. If it's a Movie: Use 'Movie Name (Year)'.\n"
-            "3. If it's a TV Show: Use 'Show Name - S00E00 - Episode Title'.\n"
-            "4. NEVER include file extensions or group tags (like 10bit, x265, PSA).\n"
-            "5. The title must be clean and look like a real movie title."
+            "You are a professional YouTube metadata expert. RULES:\n"
+            "1. NO 'Trailer', 'Teaser', 'Clip', 'Official', or 'Promo'.\n"
+            "2. For Movies: 'Name (Year)'. For TV: 'Name - S00E00 - Title'.\n"
+            "3. NO file extensions or technical tags (x265, 10bit)."
         )
-        
-        prompt = f"Extract the clean movie/show title from this filename: '{filename}'. Return JSON with 'title', 'description', 'tags' (list)."
-        
+        prompt = f"Provide clean YouTube metadata (JSON: title, description, tags) for: '{filename}'"
         try:
             payload = {
                 "contents": [{"parts": [{"text": prompt}]}],
@@ -170,7 +161,8 @@ async def get_metadata(filename):
             res = requests.post(gemini_url, json=payload, timeout=20)
             if res.status_code == 200:
                 data = json.loads(res.json()['candidates'][0]['content']['parts'][0]['text'])
-                data['title'] = re.sub(r'(?i)\b(trailer|teaser|official|clip|promo|10bit|x265|hevc|web-dl)\b', '', data['title']).strip()
+                # Regex safety cleanup for unwanted terms
+                data['title'] = re.sub(r'(?i)\b(trailer|teaser|official|clip|promo|10bit|x265|hevc|web-dl|mkv|mp4)\b', '', data['title']).strip()
                 return data
         except: pass
     return {"title": clean_name, "description": "Auto-uploaded content.", "tags": ["video"]}
@@ -178,22 +170,18 @@ async def get_metadata(filename):
 def process_video_advanced(input_path):
     output_video = f"final_{os.path.basename(input_path)}.mp4"
     codec = get_video_codec(input_path)
+    print(f"🛠️  Codec Analysis: {codec.upper()}")
     
-    print(f"🛠️  Detected Codec: {codec.upper()}")
-    
-    # If it's HEVC (x265), we transcode to x264 to prevent "missing frames" on YouTube
-    # If it's x264 already, we just copy to save time
     if "hevc" in codec or "h265" in codec:
-        print("⚠️ x265 detected: Converting to x264 for YouTube compatibility (Fast Mode)...")
-        # -preset ultrafast is used to minimize conversion time in GitHub Actions
-        # -crf 23 maintains decent quality
+        print("⚠️ x265 detected: Transcoding to x264 for YouTube frame-sync fix...")
+        # Use vsync passthrough and ultrafast to maintain speed while fixing frames
         cmd = (
             f"ffmpeg -i '{input_path}' -map 0:v:0 -map 0:a:0? "
             f"-c:v libx264 -preset ultrafast -crf 23 -vsync passthrough "
             f"-c:a aac -b:a 128k -movflags +faststart -y '{output_video}'"
         )
     else:
-        print("✅ Standard codec: Using fast stream copy...")
+        print("✅ x264/Standard detected: Using lightning fast stream copy...")
         cmd = (
             f"ffmpeg -i '{input_path}' -map 0:v:0 -map 0:a:0? "
             f"-c copy -movflags +faststart -y '{output_video}'"
@@ -252,7 +240,6 @@ def upload_to_youtube(video_path, metadata, sub_path):
                     body={'snippet': {'videoId': video_id, 'language': 'en', 'name': 'English'}},
                     media_body=MediaFileUpload(sub_path)
                 ).execute()
-                print("✅ Subtitles uploaded.")
             except: pass
     except Exception as e:
         print(f"\n🔴 YouTube Error: {e}")
@@ -274,6 +261,7 @@ async def process_link(client, link):
         
         upload_to_youtube(final_video, metadata, sub_file)
 
+        # Cleanup
         for f in [raw_file, final_video, sub_file]:
             if f and os.path.exists(f): 
                 try: os.remove(f)
@@ -284,7 +272,13 @@ async def process_link(client, link):
 async def main():
     if len(sys.argv) < 2: return
     links = sys.argv[1].split(',')
-    client = TelegramClient('bot_session', os.environ['TG_API_ID'], os.environ['TG_API_HASH'])
+    client = TelegramClient(
+        'bot_session', 
+        os.environ['TG_API_ID'], 
+        os.environ['TG_API_HASH'],
+        connection_retries=None, # Infinite retries for stability
+        auto_reconnect=True
+    )
     await client.start(bot_token=TG_BOT_TOKEN)
     for link in links: await process_link(client, link)
     await client.disconnect()
