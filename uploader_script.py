@@ -8,6 +8,7 @@ import re
 import requests
 import math
 import aiofiles
+import threading
 from telethon import TelegramClient, errors, utils
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -18,14 +19,17 @@ from google.oauth2.credentials import Credentials
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 
-# 32 connections for 100MBps potential; 1MB request sizing
-CONCURRENT_CONNECTIONS = 32
+# Optimal for 100MBps: 24-32 concurrent workers
+CONCURRENT_CONNECTIONS = 24
 PART_SIZE = 1024 * 1024  # 1MB per chunk
 
 # API Keys
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '').strip()
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '').strip()
 OMDB_API_KEY = os.environ.get('OMDB_API_KEY', '').strip()
+
+# Global lock for file writing to prevent disk IO hang
+write_lock = threading.Lock()
 
 def run_command(command):
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
@@ -62,130 +66,146 @@ class ProgressTracker:
         )
         sys.stdout.flush()
 
-# --- FIXED TURBO DOWNLOADER ---
+# --- DETERMINISTIC TURBO DOWNLOADER ---
 
 async def turbo_download(client, message, output_path):
-    """
-    Saturates bandwidth using strict byte-range workers.
-    Ensures 0% overshoot and prevents hanging at the end.
-    """
     file_size = message.file.size
     tracker = ProgressTracker(file_size, prefix='🔥 TURBO-DL')
     
-    # Pre-allocate file
-    async with aiofiles.open(output_path, 'wb') as f:
-        await f.seek(file_size - 1)
-        await f.write(b'\0')
+    with open(output_path, 'wb') as f:
+        f.truncate(file_size)
 
     total_parts = math.ceil(file_size / PART_SIZE)
-    queue = asyncio.Queue()
+    ranges = []
     for i in range(total_parts):
-        queue.put_nowait(i)
+        start = i * PART_SIZE
+        end = min((i + 1) * PART_SIZE - 1, file_size - 1)
+        ranges.append((start, end))
 
-    # State to track truly finished parts
-    finished_parts = 0
+    queue = asyncio.Queue()
+    for r in ranges:
+        queue.put_nowait(r)
 
     async def worker():
-        nonlocal finished_parts
         while not queue.empty():
             try:
-                part_idx = queue.get_nowait()
+                start, end = queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-                
-            offset = part_idx * PART_SIZE
-            # Strict boundary check
-            limit = min(PART_SIZE, file_size - offset)
-            
+            limit = (end - start) + 1
             try:
-                # iter_download with absolute offset and limit
                 async for chunk in client.iter_download(
                     message.media, 
-                    offset=offset, 
+                    offset=start, 
                     limit=limit,
                     request_size=limit
                 ):
                     if not chunk: continue
-                    async with aiofiles.open(output_path, 'r+b') as f:
-                        await f.seek(offset)
-                        await f.write(chunk)
+                    with write_lock:
+                        with open(output_path, 'r+b') as f:
+                            f.seek(start)
+                            f.write(chunk)
                     tracker.update(len(chunk))
-                
-                finished_parts += 1
             except Exception:
-                await queue.put(part_idx) # Retry
-                await asyncio.sleep(0.5)
+                await queue.put((start, end))
+                await asyncio.sleep(1)
             finally:
                 queue.task_done()
 
-    # Start workers
     tasks = [asyncio.create_task(worker()) for _ in range(CONCURRENT_CONNECTIONS)]
-    
-    # Monitor for completion
     await queue.join()
-    
-    # Final shutdown of workers
     for t in tasks: t.cancel()
     
-    # Verify file on disk
     actual_size = os.path.getsize(output_path)
-    print(f"\n✅ Integrity Check: {actual_size/1024/1024:.2f} MB (Expected: {file_size/1024/1024:.2f} MB)")
-    
-    if actual_size > file_size:
-        print("⚠️ Warning: File overshoot detected. Truncating to correct size...")
+    if actual_size != file_size:
         with open(output_path, 'ab') as f:
             f.truncate(file_size)
+    print(f"\n✅ Download Verified: {os.path.getsize(output_path)/1024/1024:.2f} MB")
 
-# --- VIDEO PIPELINE ---
+# --- SMART VIDEO & AUDIO PIPELINE (ENGLISH PRIORITY) ---
 
 def process_video_advanced(input_path):
-    print("🔬 Analyzing Streams & Fixing Codecs...")
+    print("🔬 Analyzing Streams (Prioritizing English)...")
     probe_cmd = f"ffprobe -v quiet -print_format json -show_streams -show_format '{input_path}'"
     out, _, _ = run_command(probe_cmd)
     
+    video_idx, audio_idx, sub_idx = 0, 0, None
+    v_codec = "unknown"
+
     try:
         data = json.loads(out)
-        v_stream = next(s for s in data['streams'] if s['codec_type'] == 'video')
-        codec = v_stream.get('codec_name', 'unknown')
-    except:
-        codec = "unknown"
+        streams = data.get('streams', [])
+        
+        # 1. Find Best Video
+        for s in streams:
+            if s['codec_type'] == 'video':
+                video_idx = s['index']
+                v_codec = s.get('codec_name', 'unknown')
+                break
 
-    output_video = "ready_to_upload.mp4"
+        # 2. Find English Audio (Priority)
+        audio_streams = [s for s in streams if s['codec_type'] == 'audio']
+        if audio_streams:
+            # Default to first audio if no English found
+            audio_idx = audio_streams[0]['index']
+            for s in audio_streams:
+                lang = s.get('tags', {}).get('language', '').lower()
+                if lang in ['eng', 'en', 'english']:
+                    audio_idx = s['index']
+                    print(f"🔊 English Audio Found: Stream #{audio_idx}")
+                    break
+        
+        # 3. Find English Subtitles
+        sub_streams = [s for s in streams if s['codec_type'] == 'subtitle']
+        for s in sub_streams:
+            lang = s.get('tags', {}).get('language', '').lower()
+            if lang in ['eng', 'en', 'english']:
+                sub_idx = s['index']
+                print(f"📝 English Subtitles Found: Stream #{sub_idx}")
+                break
+    except Exception as e:
+        print(f"⚠️ Metadata analysis warning: {e}")
+
+    output_video = "upload_ready.mp4"
     sub_file = "subs.srt"
     
-    # Fix HEVC/H265 for YouTube processing
-    if 'hevc' in codec or 'h265' in codec:
-        print(f"⚠️  HEVC Detected. Transcoding to x264 to prevent YouTube frame-drops...")
-        cmd = f"ffmpeg -i '{input_path}' -c:v libx264 -crf 19 -preset superfast -c:a aac -b:a 192k -movflags +faststart -y {output_video}"
-    else:
-        print("✅ Codec is YouTube-Native. Remuxing...")
-        cmd = f"ffmpeg -i '{input_path}' -c copy -movflags +faststart -y {output_video}"
+    # Video Parameters
+    video_params = "-c:v libx264 -crf 19 -preset superfast" if ('hevc' in v_codec or 'h265' in v_codec) else "-c:v copy"
+    # Audio Parameters (Always transcode to AAC for YT stability)
+    audio_params = f"-c:a aac -b:a 192k -ac 2"
 
+    print(f"🎬 Processing: Video Stream #{video_idx} | Audio Stream #{audio_idx}")
+    # Map specific English tracks
+    cmd = f"ffmpeg -i '{input_path}' -map 0:{video_idx} -map 0:{audio_idx} {video_params} {audio_params} -movflags +faststart -y {output_video}"
     run_command(cmd)
-    run_command(f"ffmpeg -i '{input_path}' -map 0:s:0? '{sub_file}' -y")
+    
+    # Extract English Subtitles if found
+    if sub_idx is not None:
+        run_command(f"ffmpeg -i '{input_path}' -map 0:{sub_idx} '{sub_file}' -y")
+    
     has_sub = os.path.exists(sub_file) and os.path.getsize(sub_file) > 100
-
     return output_video, (sub_file if has_sub else None)
 
-# --- METADATA ---
+# --- METADATA ENHANCEMENT ---
 
 def fetch_omdb(filename):
     if not OMDB_API_KEY: return None
     try:
-        query = re.sub(r'\(.*?\)|\[.*?\]', '', filename).strip()
-        return requests.get(f"http://www.omdbapi.com/?t={query}&apikey={OMDB_API_KEY}", timeout=5).json()
+        q = re.sub(r'\(.*?\)|\[.*?\]|1080p|720p|WEB-DL|HDR|H264|H265|x264|x265', '', filename).strip()
+        return requests.get(f"http://www.omdbapi.com/?t={q}&apikey={OMDB_API_KEY}", timeout=5).json()
     except: return None
 
 async def generate_metadata(filename):
-    print("🧠 Gemini AI: Crafting Metadata...")
+    print("🧠 Gemini AI: Crafting English Metadata...")
     omdb = fetch_omdb(filename)
     
     if not GEMINI_API_KEY:
-        return {"title": (omdb['Title'] if omdb else filename)[:90], "description": "High Speed Upload", "tags": []}
+        title = (omdb['Title'] if omdb else filename)[:90]
+        return {"title": title, "description": "High Performance Upload", "tags": []}
 
     prompt = (
-        f"Generate Premium YouTube Metadata for: '{filename}'.\n"
-        f"OMDb Context: {json.dumps(omdb) if omdb else 'None'}\n"
+        f"Generate English YouTube Metadata for: '{filename}'.\n"
+        f"Context from OMDb: {json.dumps(omdb) if omdb else 'None'}\n"
         "Return ONLY JSON: {'title': '...', 'description': '...', 'tags': []}"
     )
 
@@ -196,7 +216,7 @@ async def generate_metadata(filename):
     except:
         return {"title": filename[:90], "description": "Automated Upload", "tags": []}
 
-# --- YOUTUBE CORE ---
+# --- YOUTUBE UPLOAD CORE ---
 
 def upload_to_youtube(video_path, metadata, sub_path):
     try:
@@ -233,7 +253,7 @@ def upload_to_youtube(video_path, metadata, sub_path):
                 sys.stdout.write(f"\r🚀 Progress: {int(status.progress() * 100)}%")
                 sys.stdout.flush()
         
-        print(f"\n🎉 SUCCESS: https://youtu.be/{response['id']}")
+        print(f"\n🎉 DONE: https://youtu.be/{response['id']}")
 
         if sub_path:
             try:
@@ -242,31 +262,30 @@ def upload_to_youtube(video_path, metadata, sub_path):
                     body={'snippet': {'videoId': response['id'], 'language': 'en', 'name': 'English'}},
                     media_body=MediaFileUpload(sub_path)
                 ).execute()
-                print("✅ Subtitles Linked.")
+                print("✅ English Subtitles linked.")
             except: pass
             
     except Exception as e:
-        print(f"\n🔴 YT-Error: {e}")
+        print(f"\n🔴 YouTube Error: {e}")
 
 async def process_link(client, link):
     try:
         parts = [p for p in link.strip('/').split('/') if p]
-        msg_id = int(parts[-1])
-        chat_id = int(f"-100{parts[parts.index('c')+1]}")
+        msg_id, chat_id = int(parts[-1]), int(f"-100{parts[parts.index('c')+1]}")
         message = await client.get_messages(chat_id, ids=msg_id)
         
-        raw_file = f"video_{msg_id}.mkv"
+        raw_file = f"cache_{msg_id}.mkv"
         await turbo_download(client, message, raw_file)
         
         meta = await generate_metadata(message.file.name or raw_file)
-        processed, subs = process_video_advanced(raw_file)
+        proc_video, sub_path = process_video_advanced(raw_file)
         
-        upload_to_youtube(processed, meta, subs)
+        upload_to_youtube(proc_video, meta, sub_path)
 
-        for f in [raw_file, processed, subs]:
+        for f in [raw_file, proc_video, sub_path]:
             if f and os.path.exists(f): os.remove(f)
     except Exception as e:
-        print(f"\n❌ Pipeline Fault: {e}")
+        print(f"\n❌ Pipeline Error: {e}")
 
 async def main():
     if len(sys.argv) < 2: return
