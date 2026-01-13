@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Free Disk Space
+      - name: Maximize Disk Space
         run: |
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
@@ -37,10 +37,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Install Libraries
+      - name: Install High-Performance Libraries
         run: |
           pip install --upgrade pip
-          pip install --no-cache-dir telethon cryptg google-api-python-client google-auth-oauthlib google-auth-httplib2 requests aiofiles
+          pip install --no-cache-dir telethon cryptg google-api-python-client google-auth-oauthlib google-auth-httplib2 requests
 
       - name: Run Uploader
         env:
@@ -51,4 +51,5 @@ jobs:
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
         run: python uploader_script.py "${{ github.event.inputs.telegram_link }}"
