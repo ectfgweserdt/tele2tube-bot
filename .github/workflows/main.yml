@@ -1,4 +1,4 @@
-name: Fast Telegram to YouTube Bot
+name: Ultra Fast Telegram to YouTube Bot
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Maximize Disk Space
+      - name: Expand Drive Space
         run: |
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
@@ -30,19 +30,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
-      - name: Install System Tools
+      - name: Core Tools
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Install High-Performance Libraries
-        run: |
-          pip install --upgrade pip
-          pip install --no-cache-dir telethon cryptg google-api-python-client google-auth-oauthlib google-auth-httplib2 requests
+      - name: Speed Libraries
+        run: pip install --no-cache-dir telethon cryptg google-api-python-client google-auth-oauthlib google-auth-httplib2 requests aiofiles
 
-      - name: Run Uploader
+      - name: Run
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
