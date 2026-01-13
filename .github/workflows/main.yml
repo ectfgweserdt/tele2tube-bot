@@ -8,7 +8,7 @@ on:
         required: true
         type: string
 
-# Ensure only one upload runs at a time to prevent IP conflicts
+# Ensure only one upload runs at a time
 concurrency: 
   group: telegram-upload
   cancel-in-progress: false 
@@ -16,22 +16,36 @@ concurrency:
 jobs:
   upload:
     runs-on: ubuntu-latest
+    timeout-minutes: 360  # Allow up to 6 hours for large files/slow uploads
+
     steps:
       - uses: actions/checkout@v4
+      
+      # CRITICAL: Free up space for Video Processing (Transcoding can use 10GB+)
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
       
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip' # ⚡ Caches libraries to speed up next runs
-          
-      # ⚡ REMOVED: "sudo apt-get update && install ffmpeg" 
-      # Reason: FFmpeg is ALREADY pre-installed on ubuntu-latest runners.
-      # Removing this saves 30-60 seconds of startup time.
+          cache: 'pip' # Cache dependencies to speed up future runs
 
-      - name: Install High-Speed Libraries
-        run: pip install -r requirements.txt
+      - name: Install System Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffprobe -version  # Verify installation
 
-      - name: Execute
+      - name: Install Python Libraries
+        run: |
+          pip install --upgrade pip
+          pip install --no-cache-dir -r requirements.txt
+
+      - name: Run Uploader
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
