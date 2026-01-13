@@ -137,24 +137,10 @@ async def fast_download(client, message, file_path):
     print(f"\n✅ Finished! Average Speed: {(file_size/1024/1024)/duration:.2f} MB/s")
     time.sleep(0.5)
 
-def get_file_info(file_path):
-    print("\n📋 --- FILE ANALYSIS REPORT ---")
-    if not os.path.exists(file_path):
-        print("❌ File not found.")
-        return
-
-    size_mb = os.path.getsize(file_path) / (1024 * 1024)
-    print(f"📦 Size: {size_mb:.2f} MB")
-    
-    cmd = f"ffprobe -v error -select_streams v:0 -show_entries stream=width,height,duration,codec_name -of csv=p=0 '{file_path}'"
-    output, _, code = run_command(cmd)
-    
-    if code == 0 and output.strip():
-        parts = output.strip().split(',')
-        if len(parts) >= 4:
-            print(f"🎬 Resolution: {parts[0]}x{parts[1]}")
-            print(f"🎞️  Codec: {parts[2].upper()}")
-    print("------------------------------\n")
+def get_video_codec(file_path):
+    cmd = f"ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 '{file_path}'"
+    output, _, _ = run_command(cmd)
+    return output.strip().lower()
 
 async def get_metadata(filename):
     print(f"🤖 AI is crafting cinematic metadata (CLEAN TITLE MODE)...")
@@ -163,7 +149,6 @@ async def get_metadata(filename):
     if GEMINI_API_KEY:
         gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
         
-        # SYSTEM PROMPT FOR CLEAN TITLES
         system_instruction = (
             "You are a professional YouTube metadata expert. "
             "IMPORTANT RULES for TITLE:\n"
@@ -185,16 +170,36 @@ async def get_metadata(filename):
             res = requests.post(gemini_url, json=payload, timeout=20)
             if res.status_code == 200:
                 data = json.loads(res.json()['candidates'][0]['content']['parts'][0]['text'])
-                # Final safety check on title
                 data['title'] = re.sub(r'(?i)\b(trailer|teaser|official|clip|promo|10bit|x265|hevc|web-dl)\b', '', data['title']).strip()
                 return data
         except: pass
     return {"title": clean_name, "description": "Auto-uploaded content.", "tags": ["video"]}
 
 def process_video_advanced(input_path):
-    output_video = f"fast_{os.path.basename(input_path)}.mp4"
-    print(f"✂️  Optimizing Streams...")
-    run_command(f"ffmpeg -i '{input_path}' -map 0:v:0 -map 0:a:0? -c copy -y '{output_video}'")
+    output_video = f"final_{os.path.basename(input_path)}.mp4"
+    codec = get_video_codec(input_path)
+    
+    print(f"🛠️  Detected Codec: {codec.upper()}")
+    
+    # If it's HEVC (x265), we transcode to x264 to prevent "missing frames" on YouTube
+    # If it's x264 already, we just copy to save time
+    if "hevc" in codec or "h265" in codec:
+        print("⚠️ x265 detected: Converting to x264 for YouTube compatibility (Fast Mode)...")
+        # -preset ultrafast is used to minimize conversion time in GitHub Actions
+        # -crf 23 maintains decent quality
+        cmd = (
+            f"ffmpeg -i '{input_path}' -map 0:v:0 -map 0:a:0? "
+            f"-c:v libx264 -preset ultrafast -crf 23 -vsync passthrough "
+            f"-c:a aac -b:a 128k -movflags +faststart -y '{output_video}'"
+        )
+    else:
+        print("✅ Standard codec: Using fast stream copy...")
+        cmd = (
+            f"ffmpeg -i '{input_path}' -map 0:v:0 -map 0:a:0? "
+            f"-c copy -movflags +faststart -y '{output_video}'"
+        )
+    
+    run_command(cmd)
     
     if not os.path.exists(output_video) or os.path.getsize(output_video) < 5000:
         return input_path, None
@@ -247,6 +252,7 @@ def upload_to_youtube(video_path, metadata, sub_path):
                     body={'snippet': {'videoId': video_id, 'language': 'en', 'name': 'English'}},
                     media_body=MediaFileUpload(sub_path)
                 ).execute()
+                print("✅ Subtitles uploaded.")
             except: pass
     except Exception as e:
         print(f"\n🔴 YouTube Error: {e}")
@@ -269,7 +275,9 @@ async def process_link(client, link):
         upload_to_youtube(final_video, metadata, sub_file)
 
         for f in [raw_file, final_video, sub_file]:
-            if f and os.path.exists(f): os.remove(f)
+            if f and os.path.exists(f): 
+                try: os.remove(f)
+                except: pass
     except Exception as e:
         print(f"\n❌ Link Failure: {e}")
 
