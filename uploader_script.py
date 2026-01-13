@@ -22,7 +22,7 @@ GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 
 # AGGRESSIVE CONFIGURATION FOR SPEED
 # 16-32 workers is safe on high-bandwidth servers (like GitHub Actions)
-PARALLEL_WORKERS = 20 
+PARALLEL_WORKERS = 40 
 CHUNK_SIZE_KB = 2048  # Increased to 2MB chunks for better stability with fewer seeks
 
 # Fetching API Keys
