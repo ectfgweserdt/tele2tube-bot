@@ -14,13 +14,13 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 
-# --- EXTREME PERFORMANCE CONFIG ---
+# --- PERFORMANCE CONFIG ---
 YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 
-# 100MBps Strategy: 32 Parallel streams + 1MB request sizing
-CONCURRENT_CONNECTIONS = 32 
-MAX_CHUNK_SIZE = 1024 * 1024 # 1MB
+# 32 connections for 100MBps potential; 1MB request sizing
+CONCURRENT_CONNECTIONS = 32
+PART_SIZE = 1024 * 1024  # 1MB per chunk
 
 # API Keys
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '').strip()
@@ -62,69 +62,84 @@ class ProgressTracker:
         )
         sys.stdout.flush()
 
-# --- TURBO DOWNLOADER ENGINE ---
+# --- FIXED TURBO DOWNLOADER ---
 
 async def turbo_download(client, message, output_path):
     """
-    Saturates 1Gbps bandwidth using 32 concurrent socket segments.
-    Explicitly prevents overshooting and hanging at 99%.
+    Saturates bandwidth using strict byte-range workers.
+    Ensures 0% overshoot and prevents hanging at the end.
     """
     file_size = message.file.size
     tracker = ProgressTracker(file_size, prefix='🔥 TURBO-DL')
     
-    # Pre-allocate sparse file for instant writing
+    # Pre-allocate file
     async with aiofiles.open(output_path, 'wb') as f:
         await f.seek(file_size - 1)
         await f.write(b'\0')
 
-    part_size = 1024 * 1024 # 1MB parts
-    total_parts = math.ceil(file_size / part_size)
+    total_parts = math.ceil(file_size / PART_SIZE)
     queue = asyncio.Queue()
     for i in range(total_parts):
         queue.put_nowait(i)
 
-    print(f"📡 Launching {CONCURRENT_CONNECTIONS} Socket Streams...")
+    # State to track truly finished parts
+    finished_parts = 0
 
     async def worker():
+        nonlocal finished_parts
         while not queue.empty():
             try:
                 part_idx = queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
                 
-            offset = part_idx * part_size
-            limit = min(part_size, file_size - offset)
+            offset = part_idx * PART_SIZE
+            # Strict boundary check
+            limit = min(PART_SIZE, file_size - offset)
             
             try:
-                # Direct byte-range request
+                # iter_download with absolute offset and limit
                 async for chunk in client.iter_download(
                     message.media, 
                     offset=offset, 
                     limit=limit,
                     request_size=limit
                 ):
+                    if not chunk: continue
                     async with aiofiles.open(output_path, 'r+b') as f:
                         await f.seek(offset)
                         await f.write(chunk)
                     tracker.update(len(chunk))
+                
+                finished_parts += 1
             except Exception:
-                await queue.put(part_idx) # Retry on flood/timeout
+                await queue.put(part_idx) # Retry
                 await asyncio.sleep(0.5)
             finally:
                 queue.task_done()
 
-    # Distribute load across workers
+    # Start workers
     tasks = [asyncio.create_task(worker()) for _ in range(CONCURRENT_CONNECTIONS)]
+    
+    # Monitor for completion
     await queue.join()
     
-    # Force kill tasks to prevent hanging
+    # Final shutdown of workers
     for t in tasks: t.cancel()
-    print(f"\n✅ Integrity Check Passed: {os.path.getsize(output_path)/1024/1024:.2f} MB")
+    
+    # Verify file on disk
+    actual_size = os.path.getsize(output_path)
+    print(f"\n✅ Integrity Check: {actual_size/1024/1024:.2f} MB (Expected: {file_size/1024/1024:.2f} MB)")
+    
+    if actual_size > file_size:
+        print("⚠️ Warning: File overshoot detected. Truncating to correct size...")
+        with open(output_path, 'ab') as f:
+            f.truncate(file_size)
 
-# --- VIDEO LOGIC ---
+# --- VIDEO PIPELINE ---
 
 def process_video_advanced(input_path):
-    print("🔬 Processing Pipeline: Correcting Codecs...")
+    print("🔬 Analyzing Streams & Fixing Codecs...")
     probe_cmd = f"ffprobe -v quiet -print_format json -show_streams -show_format '{input_path}'"
     out, _, _ = run_command(probe_cmd)
     
@@ -135,20 +150,18 @@ def process_video_advanced(input_path):
     except:
         codec = "unknown"
 
-    output_video = "ready_for_yt.mp4"
+    output_video = "ready_to_upload.mp4"
     sub_file = "subs.srt"
     
-    # YouTube HEVC fix
+    # Fix HEVC/H265 for YouTube processing
     if 'hevc' in codec or 'h265' in codec:
-        print(f"⚠️  Converting HEVC -> x264 (Ensures no missing frames on YT)")
+        print(f"⚠️  HEVC Detected. Transcoding to x264 to prevent YouTube frame-drops...")
         cmd = f"ffmpeg -i '{input_path}' -c:v libx264 -crf 19 -preset superfast -c:a aac -b:a 192k -movflags +faststart -y {output_video}"
     else:
-        print("✅ Remuxing to YT-Native container")
+        print("✅ Codec is YouTube-Native. Remuxing...")
         cmd = f"ffmpeg -i '{input_path}' -c copy -movflags +faststart -y {output_video}"
 
     run_command(cmd)
-    
-    # Subtitles
     run_command(f"ffmpeg -i '{input_path}' -map 0:s:0? '{sub_file}' -y")
     has_sub = os.path.exists(sub_file) and os.path.getsize(sub_file) > 100
 
@@ -159,12 +172,12 @@ def process_video_advanced(input_path):
 def fetch_omdb(filename):
     if not OMDB_API_KEY: return None
     try:
-        q = re.sub(r'\(.*?\)|\[.*?\]', '', filename).strip()
-        return requests.get(f"http://www.omdbapi.com/?t={q}&apikey={OMDB_API_KEY}", timeout=5).json()
+        query = re.sub(r'\(.*?\)|\[.*?\]', '', filename).strip()
+        return requests.get(f"http://www.omdbapi.com/?t={query}&apikey={OMDB_API_KEY}", timeout=5).json()
     except: return None
 
 async def generate_metadata(filename):
-    print("🧠 Gemini AI: Crafting Cinematic Metadata...")
+    print("🧠 Gemini AI: Crafting Metadata...")
     omdb = fetch_omdb(filename)
     
     if not GEMINI_API_KEY:
@@ -172,8 +185,8 @@ async def generate_metadata(filename):
 
     prompt = (
         f"Generate Premium YouTube Metadata for: '{filename}'.\n"
-        f"Data: {json.dumps(omdb) if omdb else 'None'}\n"
-        "Output ONLY JSON: {'title': '...', 'description': '...', 'tags': []}"
+        f"OMDb Context: {json.dumps(omdb) if omdb else 'None'}\n"
+        "Return ONLY JSON: {'title': '...', 'description': '...', 'tags': []}"
     )
 
     try:
@@ -183,7 +196,7 @@ async def generate_metadata(filename):
     except:
         return {"title": filename[:90], "description": "Automated Upload", "tags": []}
 
-# --- YOUTUBE UPLOAD ---
+# --- YOUTUBE CORE ---
 
 def upload_to_youtube(video_path, metadata, sub_path):
     try:
@@ -220,7 +233,7 @@ def upload_to_youtube(video_path, metadata, sub_path):
                 sys.stdout.write(f"\r🚀 Progress: {int(status.progress() * 100)}%")
                 sys.stdout.flush()
         
-        print(f"\n🎉 VIDEO LIVE: https://youtu.be/{response['id']}")
+        print(f"\n🎉 SUCCESS: https://youtu.be/{response['id']}")
 
         if sub_path:
             try:
@@ -242,7 +255,7 @@ async def process_link(client, link):
         chat_id = int(f"-100{parts[parts.index('c')+1]}")
         message = await client.get_messages(chat_id, ids=msg_id)
         
-        raw_file = f"fast_{msg_id}.mkv"
+        raw_file = f"video_{msg_id}.mkv"
         await turbo_download(client, message, raw_file)
         
         meta = await generate_metadata(message.file.name or raw_file)
