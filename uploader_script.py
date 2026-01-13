@@ -18,7 +18,7 @@ YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 
 # Optimization Constants
-MAX_WORKERS = 16  # High concurrency for speed
+MAX_WORKERS = 20  # High concurrency for speed
 CHUNK_SIZE = 1024 * 1024  # 1MB per request
 
 # Environment Variables
