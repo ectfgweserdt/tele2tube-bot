@@ -1,29 +1,37 @@
-name: Superior Movie Bot
+name: Fast Telegram to YouTube Bot
 
 on:
-  workflow_dispatch: # Manual trigger to start the bot
+  workflow_dispatch:
+    inputs:
+      telegram_link:
+        description: 'Telegram Links (Comma separated)'
+        required: true
+        type: string
+
+# Ensure only one upload runs at a time to prevent IP conflicts
+concurrency: 
+  group: telegram-upload
+  cancel-in-progress: false 
 
 jobs:
-  run-bot:
+  upload:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip' # ⚡ Caches libraries to speed up next runs
+          
+      # ⚡ REMOVED: "sudo apt-get update && install ffmpeg" 
+      # Reason: FFmpeg is ALREADY pre-installed on ubuntu-latest runners.
+      # Removing this saves 30-60 seconds of startup time.
 
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg python3-libtorrent
+      - name: Install High-Speed Libraries
+        run: pip install -r requirements.txt
 
-      - name: Install Python Libraries
-        run: |
-          pip install -r requirements.txt
-
-      - name: Start Interactive Bot
+      - name: Execute
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -31,4 +39,6 @@ jobs:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-        run: python uploader_script.py
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
+        run: python uploader_script.py "${{ github.event.inputs.telegram_link }}"
