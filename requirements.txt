@@ -1,8 +1,8 @@
 telethon
 cryptg
-uvloop
 google-api-python-client
 google-auth-oauthlib
+google-auth-httplib2
 requests
-1337x
-beautifulsoup4
+aiofiles
+hachoir
