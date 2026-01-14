@@ -1,4 +1,4 @@
-name: Ultra Fast Telegram to YouTube Bot
+name: Fast Telegram to YouTube Bot
 
 on:
   workflow_dispatch:
@@ -8,6 +8,7 @@ on:
         required: true
         type: string
 
+# Prevent concurrent runs to save bandwidth and API limits
 concurrency: 
   group: telegram-upload
   cancel-in-progress: false 
@@ -15,31 +16,23 @@ concurrency:
 jobs:
   upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Expand Drive Space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
       
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Core Tools
+          cache: 'pip'
+          
+      - name: Install System Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
-
-      - name: Speed Libraries
-        run: pip install --no-cache-dir telethon cryptg google-api-python-client google-auth-oauthlib google-auth-httplib2 requests aiofiles
-
-      - name: Run
+          sudo apt-get install -y ffmpeg atomicparsley
+          
+      - name: Install Python Dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+        
+      - name: Execute Pipeline
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
