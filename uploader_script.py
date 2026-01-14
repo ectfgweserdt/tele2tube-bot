@@ -21,7 +21,7 @@ YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 
 # Network & Download Settings
-# Increased connections for speed, but managed via continuous streams now
+# 8 connections is optimal for Telegram's DC limits
 PARALLEL_CONNECTIONS = 8   
 MAX_RETRIES = 10
 
@@ -72,61 +72,64 @@ class ProgressTracker:
             )
             sys.stdout.flush()
 
-# --- 📥 SMART PARALLEL DOWNLOADER (v2.0 Fix) ---
+# --- 📥 SMART PARALLEL DOWNLOADER (v2.1 Fix) ---
 class SmartDownloader:
     @staticmethod
-    async def download_worker(client, location, start, end, file_path, tracker, part_id):
-        """Downloads a large segment continuously to avoid connection fragmentation."""
+    async def download_worker(client, location, start, end, file_path, tracker, part_id, io_lock):
+        """Downloads a large segment using a persistent file handle to prevent locking issues."""
         current = start
         
-        while current < end:
-            try:
-                # Request the FULL remaining amount for this worker's segment
-                # We let Telethon handle the internal chunking for stability
-                bytes_left = end - current
-                
-                # chunk_size: Size of data yielded to python loop (write buffer)
-                # request_size: Size of data requested from Telegram DC (network buffer)
-                # 512KB is the sweet spot for stability vs RAM usage
-                async for chunk in client.iter_download(
-                    location,
-                    offset=current,
-                    limit=bytes_left,
-                    chunk_size=512 * 1024, 
-                    request_size=512 * 1024 
-                ):
-                    if not chunk: break
+        # Open file ONCE per worker (fixes open/close overhead hang)
+        async with aiofiles.open(file_path, "r+b") as f:
+            while current < end:
+                try:
+                    bytes_left = end - current
+                    if bytes_left <= 0: break
                     
-                    # Async Write: Prevents blocking the event loop
-                    async with aiofiles.open(file_path, "r+b") as f:
-                        await f.seek(current)
-                        await f.write(chunk)
+                    # Request chunks
+                    async for chunk in client.iter_download(
+                        location,
+                        offset=current,
+                        limit=bytes_left,
+                        chunk_size=512 * 1024, 
+                        request_size=512 * 1024 
+                    ):
+                        if not chunk: break
+                        
+                        chunk_len = len(chunk)
+                        
+                        # ATOMIC WRITE: Ensure no two workers seek/write at the same time
+                        async with io_lock:
+                            await f.seek(current)
+                            await f.write(chunk)
+                        
+                        current += chunk_len
+                        await tracker.update(chunk_len)
+                        
+                        if current >= end: break
                     
-                    written = len(chunk)
-                    current += written
-                    await tracker.update(written)
-                    
+                    # Double check loop exit
                     if current >= end: break
                     
-            except Exception as e:
-                print(f"\n⚠️ Part {part_id} interrupted at {current}. Retrying... ({e})")
-                await asyncio.sleep(2)
+                except Exception as e:
+                    print(f"\n⚠️ Part {part_id} error: {e}. Retrying...")
+                    await asyncio.sleep(2)
 
     @staticmethod
     async def download(client, message, file_path):
-        print(f"\n📡 Initiating Continuous Stream Parallel Download...")
+        print(f"\n📡 Initiating High-Speed Parallel Download...")
         
         file_size = message.file.size
         
-        # 1. Pre-allocate disk space (Critical for async writing)
-        # We use standard open here because truncate is fast and synchronous
+        # 1. Pre-allocate disk space
         with open(file_path, "wb") as f:
             f.truncate(file_size)
             
-        # 2. Split into parts
+        # 2. Setup workers
         part_size = file_size // PARALLEL_CONNECTIONS
         tasks = []
         tracker = ProgressTracker(file_size, prefix='📥 DL')
+        io_lock = asyncio.Lock() # Global lock for file IO
         
         location = message.document
         
@@ -135,13 +138,14 @@ class SmartDownloader:
             end = start + part_size if i < PARALLEL_CONNECTIONS - 1 else file_size
             
             task = asyncio.create_task(
-                SmartDownloader.download_worker(client, location, start, end, file_path, tracker, i)
+                SmartDownloader.download_worker(client, location, start, end, file_path, tracker, i, io_lock)
             )
             tasks.append(task)
             
         # 3. Wait for all parts
         await asyncio.gather(*tasks)
         
+        # Force a final newline for UI cleanup
         print(f"\n✅ Download Verified: {file_size / 1024 / 1024:.2f} MB")
 
 # --- 🎥 INTELLIGENT VIDEO PIPELINE ---
@@ -207,7 +211,7 @@ class VideoPipeline:
 
         print(f"⏱️ Processing finished in {time.time() - t0:.2f}s")
         
-        final_info = VideoPipeline.get_stream_info(output_path)
+        # Gather stats
         stats = {
             "res": f"{width}p",
             "size": f"{os.path.getsize(output_path)/1024/1024:.1f} MB",
