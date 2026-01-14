@@ -21,8 +21,8 @@ YOUTUBE_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 
 # Network & Download Settings
-PARALLEL_CONNECTIONS = 8   # Number of simultaneous connections (Telegram limit is usually ~4-8 per DC)
-CHUNK_SIZE = 1024 * 1024 * 2 # 2MB chunks for granular control
+# Increased connections for speed, but managed via continuous streams now
+PARALLEL_CONNECTIONS = 8   
 MAX_RETRIES = 10
 
 # Fetching API Keys
@@ -50,6 +50,7 @@ class ProgressTracker:
         async with self.lock:
             self.downloaded += size
             now = time.time()
+            # Update UI every 0.5s or if complete
             if now - self.last_ui_update < 0.5 and self.downloaded < self.total_size:
                 return
 
@@ -71,53 +72,54 @@ class ProgressTracker:
             )
             sys.stdout.flush()
 
-# --- 📥 SMART PARALLEL DOWNLOADER ---
+# --- 📥 SMART PARALLEL DOWNLOADER (v2.0 Fix) ---
 class SmartDownloader:
     @staticmethod
     async def download_worker(client, location, start, end, file_path, tracker, part_id):
-        """Downloads a specific byte range of the file."""
-        current_offset = start
-        retry_count = 0
+        """Downloads a large segment continuously to avoid connection fragmentation."""
+        current = start
         
-        while current_offset < end:
+        while current < end:
             try:
-                # Calculate chunk size (don't overflow 'end')
-                request_size = min(CHUNK_SIZE, end - current_offset)
+                # Request the FULL remaining amount for this worker's segment
+                # We let Telethon handle the internal chunking for stability
+                bytes_left = end - current
                 
-                # Telethon iter_download with offset/limit
+                # chunk_size: Size of data yielded to python loop (write buffer)
+                # request_size: Size of data requested from Telegram DC (network buffer)
+                # 512KB is the sweet spot for stability vs RAM usage
                 async for chunk in client.iter_download(
-                    location, offset=current_offset, limit=request_size, chunk_size=request_size, request_size=request_size
+                    location,
+                    offset=current,
+                    limit=bytes_left,
+                    chunk_size=512 * 1024, 
+                    request_size=512 * 1024 
                 ):
-                    # Write directly to specific file position (Thread-safe file IO required)
-                    # We open the file in r+b mode for each write to avoid seeking conflicts or use a shared handle
-                    # For safety in async, we'll open-seek-write-close or use aiofiles with a lock if needed.
-                    # Since OS file handles have state, we need to be careful.
-                    # Fast approach: specific open for this write or shared handle with lock.
+                    if not chunk: break
                     
-                    with open(file_path, "r+b") as f:
-                        f.seek(current_offset)
-                        f.write(chunk)
+                    # Async Write: Prevents blocking the event loop
+                    async with aiofiles.open(file_path, "r+b") as f:
+                        await f.seek(current)
+                        await f.write(chunk)
                     
                     written = len(chunk)
-                    current_offset += written
+                    current += written
                     await tracker.update(written)
                     
-                    if current_offset >= end:
-                        break
+                    if current >= end: break
+                    
             except Exception as e:
-                retry_count += 1
-                if retry_count > MAX_RETRIES:
-                    print(f"\n❌ Chunk {part_id} failed after retries: {e}")
-                    raise e
-                await asyncio.sleep(1 * retry_count)
+                print(f"\n⚠️ Part {part_id} interrupted at {current}. Retrying... ({e})")
+                await asyncio.sleep(2)
 
     @staticmethod
     async def download(client, message, file_path):
-        print(f"\n📡 Initiating 50MBps+ Parallel Download Pipeline...")
+        print(f"\n📡 Initiating Continuous Stream Parallel Download...")
         
         file_size = message.file.size
         
-        # 1. Pre-allocate disk space (prevents fragmentation and download overload)
+        # 1. Pre-allocate disk space (Critical for async writing)
+        # We use standard open here because truncate is fast and synchronous
         with open(file_path, "wb") as f:
             f.truncate(file_size)
             
@@ -132,7 +134,6 @@ class SmartDownloader:
             start = i * part_size
             end = start + part_size if i < PARALLEL_CONNECTIONS - 1 else file_size
             
-            # Create async worker for this chunk
             task = asyncio.create_task(
                 SmartDownloader.download_worker(client, location, start, end, file_path, tracker, i)
             )
@@ -163,7 +164,7 @@ class VideoPipeline:
         
         if not video_stream:
             print("⚠️ No video stream found!")
-            return input_path, None
+            return input_path, None, {}
 
         codec = video_stream.get('codec_name', 'unknown')
         width = int(video_stream.get('width', 0))
@@ -173,45 +174,39 @@ class VideoPipeline:
         sub_path = "extracted_subs.srt"
         
         # --- LOGIC: x265/HEVC Detection ---
-        # YouTube often drops frames on x265 MKVs. We enforce H.264 if HEVC is found.
         needs_transcode = False
-        if codec == 'hevc' or codec == 'vp9':
-            print("🚨 High-Efficiency Codec detected (HEVC/VP9). Transcoding to H.264 for YouTube stability...")
+        if codec in ['hevc', 'vp9', 'av1']:
+            print("🚨 High-Efficiency Codec detected. Transcoding to H.264 for YouTube stability...")
             needs_transcode = True
         
-        # Extract English Subs if available
+        # Extract English Subs
         print("📜 Extracting subtitles...")
         run_command(f"ffmpeg -y -i '{input_path}' -map 0:s:0? -c:s srt '{sub_path}'")
         has_subs = os.path.exists(sub_path) and os.path.getsize(sub_path) > 100
         
-        # Build FFmpeg Command
         if needs_transcode:
-            # High Quality, Fast Preset for GitHub Actions
-            # CRF 23 is visual standard. Preset 'fast' gives 50fps+ on modern CPUs.
+            # CRF 23 = High Quality, Preset Fast = Good Speed
             cmd = (
                 f"ffmpeg -y -v error -i '{input_path}' "
                 f"-c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p "
-                f"-c:a copy " # Copy audio (usually AAC/AC3 is fine)
+                f"-c:a copy "
                 f"'{output_path}'"
             )
         else:
-            # Fast Remux (Copy) - Changes container to MP4 without re-encoding
+            # Fast Remux
             print("✅ Codec is safe. Performing Fast Remux...")
             cmd = f"ffmpeg -y -v error -i '{input_path}' -c copy -map 0:v:0 -map 0:a:0? '{output_path}'"
 
-        # Execute
         t0 = time.time()
         out, err, code = run_command(cmd)
         
         if code != 0:
             print(f"❌ FFmpeg Error: {err}")
-            # Fallback: Try a super-safe re-encode if copy failed
             print("⚠️ Retrying with Safe Mode...")
             run_command(f"ffmpeg -y -i '{input_path}' -c:v libx264 -preset veryfast -c:a aac '{output_path}'")
 
         print(f"⏱️ Processing finished in {time.time() - t0:.2f}s")
         
-        # Gather stats for UI
         final_info = VideoPipeline.get_stream_info(output_path)
         stats = {
             "res": f"{width}p",
@@ -227,14 +222,12 @@ class MetadataEngine:
     def get_clean_metadata(filename, file_stats, omdb_key=None, gemini_key=None):
         print("🤖 AI is designing the YouTube page...")
         
-        # 1. Clean filename locally first
         clean_name = re.sub(r'\.|_|20\d\d|1080p|720p|WEBRip|Bluray|x265|HEVC|AAC|5\.1', ' ', filename)
         clean_name = re.sub(r'\s+', ' ', clean_name).strip()
         
         omdb_data = {}
         if omdb_key:
             try:
-                # Basic OMDb lookup
                 search = clean_name.split('S0')[0].strip()
                 res = requests.get(f"http://www.omdbapi.com/?t={search}&apikey={omdb_key}")
                 if res.status_code == 200: omdb_data = res.json()
@@ -243,7 +236,6 @@ class MetadataEngine:
         if not gemini_key:
             return {"title": clean_name, "description": "Uploaded via FastBot", "tags": ["video"]}
 
-        # 2. Advanced Gemini Prompt
         prompt = f"""
         Analyze this filename: "{filename}"
         OMDb Data: {json.dumps(omdb_data)}
@@ -253,7 +245,6 @@ class MetadataEngine:
         Guidelines:
         1. TITLE: Clean, Professional. Format: "Movie Name (Year) | 4K HDR" or "Show Name - S01E01 - Episode Title". 
            - REMOVE words like: Trailer, Teaser, Official, Hindi, Lat, Eng, MKV, MP4.
-           - If it's a TV show, identify Season/Episode from filename.
         
         2. DESCRIPTION:
            - "🎬 Synopsis": A gripping 3-sentence summary.
@@ -273,7 +264,6 @@ class MetadataEngine:
             data = res.json()['candidates'][0]['content']['parts'][0]['text']
             meta = json.loads(data)
             
-            # 3. Append Technical Stats (User Request: "Add more information")
             tech_footer = (
                 f"\n\n━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"⚙️ File Information:\n"
@@ -305,10 +295,10 @@ def upload_to_youtube(video_path, metadata, sub_path):
         
         body = {
             'snippet': {
-                'title': metadata['title'][:95], # YT limit 100
+                'title': metadata['title'][:95],
                 'description': metadata['description'],
                 'tags': metadata['tags'][:15],
-                'categoryId': '24' # Entertainment
+                'categoryId': '24'
             },
             'status': {'privacyStatus': 'private'}
         }
@@ -335,7 +325,7 @@ def upload_to_youtube(video_path, metadata, sub_path):
                     media_body=MediaFileUpload(sub_path),
                     sync=True 
                 ).execute()
-            except: print("⚠️ Subtitle upload failed (might be duplicate).")
+            except: print("⚠️ Subtitle upload failed.")
             
         print(f"🎉 FINAL LINK: https://youtu.be/{video_id}")
         
@@ -345,11 +335,9 @@ def upload_to_youtube(video_path, metadata, sub_path):
 # --- 🏃‍♂️ MAIN LOOP ---
 async def process_link(client, link):
     try:
-        # Link Parsing
         parts = [p for p in link.strip('/').split('/') if p]
         if 't.me' not in link: return
         
-        # Support for public and private links
         if 'c' in parts:
             chat_id = int(f"-100{parts[parts.index('c')+1]}")
             msg_id = int(parts[-1])
@@ -359,24 +347,19 @@ async def process_link(client, link):
 
         message = await client.get_messages(chat_id, ids=msg_id)
         if not message or not message.media:
-            print("❌ No media found in message.")
+            print("❌ No media found.")
             return
 
         raw_file = f"downloaded_media_{msg_id}.mkv"
         
-        # 1. Download
         await SmartDownloader.download(client, message, raw_file)
         
-        # 2. Process
         final_video, sub_file, stats = VideoPipeline.process(raw_file)
         
-        # 3. Metadata
         meta = MetadataEngine.get_clean_metadata(message.file.name or "Unknown Video", stats, OMDB_API_KEY, GEMINI_API_KEY)
         
-        # 4. Upload
         upload_to_youtube(final_video, meta, sub_file)
 
-        # Cleanup
         for f in [raw_file, final_video, sub_file, "processed_video.mp4"]:
             if f and os.path.exists(f): os.remove(f)
             
@@ -386,13 +369,10 @@ async def process_link(client, link):
         traceback.print_exc()
 
 async def main():
-    if len(sys.argv) < 2: 
-        print("Usage: python uploader.py <links>")
-        return
-        
+    if len(sys.argv) < 2: return
     links = sys.argv[1].split(',')
     
-    print("🔌 Connecting to Telegram...")
+    print("🔌 Connecting...")
     client = TelegramClient(
         'bot_session', 
         os.environ['TG_API_ID'], 
