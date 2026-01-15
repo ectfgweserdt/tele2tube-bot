@@ -1,0 +1,19 @@
+Python
+
+pycache/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+Project specific
+
+downloads/
+processed/
+*.session
+*.session-journal
+
+Secrets (NEVER COMMIT THESE)
+
+client_secrets.json
+token.json
