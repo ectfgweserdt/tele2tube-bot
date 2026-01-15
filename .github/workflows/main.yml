@@ -39,6 +39,7 @@ jobs:
           OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           YOUTUBE_CLIENT_SECRETS: ${{ secrets.YOUTUBE_CLIENT_SECRETS }}
-          YOUTUBE_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }} # Map the new secret name to the existing variable
+          # This line maps your GitHub Secret to the Env Var the script needs
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }} 
           CHANNEL_LINK: ${{ github.event.inputs.channel_link }}
         run: python main.py
