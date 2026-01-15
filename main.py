@@ -31,18 +31,30 @@ async def main_workflow():
     # Initialize the client
     client = TelegramClient(config.SESSION_NAME, config.API_ID, config.API_HASH)
     
-    # FIX: Correct way to start the bot and use it as a context manager
     await client.start(bot_token=config.BOT_TOKEN)
     
+    downloaded_file = None
+    
     async with client:
-        print(f"Logged in successfully as bot. Checking channel: {config.CHANNEL_ENTITY}")
-        downloaded_file = await download_latest_video(client, config.CHANNEL_ENTITY, config.DOWNLOAD_PATH)
+        # If the user provided a specific ID, use it. Otherwise, scan all dialogs.
+        if config.CHANNEL_ENTITY and config.CHANNEL_ENTITY.strip() != "":
+            print(f"Checking specific channel ID: {config.CHANNEL_ENTITY}")
+            downloaded_file = await download_latest_video(client, config.CHANNEL_ENTITY, config.DOWNLOAD_PATH)
+        else:
+            print("No specific channel ID provided. Scanning all bot dialogs...")
+            dialogs = await client.get_dialogs()
+            for dialog in dialogs:
+                if dialog.is_channel or dialog.is_group:
+                    print(f"Checking: {dialog.name} ({dialog.id})")
+                    downloaded_file = await download_latest_video(client, dialog.id, config.DOWNLOAD_PATH)
+                    if downloaded_file:
+                        break # Stop at the first video found to avoid hitting upload limits
         
         if not downloaded_file:
-            print("Workflow finished: No new video found or error during download.")
+            print("Workflow finished: No new video found in any accessible channel.")
             return
 
-    # 2. Inspect & Process Media (Outside the 'async with client' block to free Telegram resources)
+    # 2. Inspect & Process Media
     video_index, audio_index = inspect_and_select_streams(downloaded_file)
     if video_index is None or audio_index is None:
         print("Could not find valid video/audio streams.")
