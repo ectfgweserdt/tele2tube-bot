@@ -1,6 +1,7 @@
 import PTN
 import requests
-from google import genai # Modern library to fix deprecation warning
+# Ensure you have installed 'google-genai' and NOT 'google-generativeai'
+from google import genai 
 
 def get_omdb_metadata(api_key, title, year=None, season=None, episode=None):
     """Queries the OMDB API for movie or TV show metadata."""
@@ -37,8 +38,9 @@ def generate_youtube_description_with_gemini(api_key, metadata):
         
         prompt = f"Write a catchy YouTube description for the movie/show: {metadata.get('Title')}. Plot: {metadata.get('Plot')}"
         
+        # Using a stable model version
         response = client.models.generate_content(
-            model='gemini-2.0-flash-exp', # Using the latest flash model
+            model='gemini-2.0-flash', 
             contents=prompt
         )
         return response.text
