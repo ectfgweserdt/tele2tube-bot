@@ -1,59 +1,45 @@
-name: Fast Telegram to YouTube Bot
+name: Manual Video Processing Pipeline
 
 on:
   workflow_dispatch:
     inputs:
-      telegram_link:
-        description: 'Telegram Links (Comma separated)'
+      channel_link:
+        description: 'Telegram channel username or private invite link'
         required: true
-        type: string
-
-# Prevent concurrent runs from fighting for IP/Network bandwidth
-concurrency: 
-  group: telegram-upload
-  cancel-in-progress: false 
+        default: 'https://t.me/joinchat/...'
 
 jobs:
-  upload:
+  process-and-upload:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Set up Python
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip' # Automated caching for faster startup
+          python-version: '3.10'
+          cache: 'pip'
 
-      - name: Maximize Runner Space
+      - name: Install Python dependencies
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          
+      - name: Set up FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install System Tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg jq
-          # Verify ffmpeg has x264/aac support
-          ffmpeg -version
-
-      - name: Install High-Speed Libraries
-        run: |
-          pip install --upgrade pip
-          pip install --no-cache-dir -r requirements.txt
-
-      - name: Execute Pipeline
+      - name: Run Video Automation Script
         env:
-          TG_API_ID: ${{ secrets.TG_API_ID }}
-          TG_API_HASH: ${{ secrets.TG_API_HASH }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Mapping Secrets to Environment Variables
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
-          # Force IPv4/IPv6 preference if needed for stability
-          PYTHONUNBUFFERED: "1" 
-        run: python uploader_script.py "${{ github.event.inputs.telegram_link }}"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YOUTUBE_CLIENT_SECRETS: ${{ secrets.YOUTUBE_CLIENT_SECRETS }}
+          YOUTUBE_TOKEN: ${{ secrets.YOUTUBE_TOKEN }}
+          CHANNEL_LINK: ${{ github.event.inputs.channel_link }}
+        run: python main.py
