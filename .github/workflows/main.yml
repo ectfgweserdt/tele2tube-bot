@@ -6,7 +6,7 @@ on:
       channel_link:
         description: 'Telegram channel username or private invite link'
         required: true
-        default: 'https://t.me/joinchat/...'
+        default: 'https://t.me/...'
 
 jobs:
   process-and-upload:
@@ -16,10 +16,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.10
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
           cache: 'pip'
 
       - name: Install Python dependencies
@@ -36,10 +36,10 @@ jobs:
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           YOUTUBE_CLIENT_SECRETS: ${{ secrets.YOUTUBE_CLIENT_SECRETS }}
-          # This line maps your GitHub Secret to the Env Var the script needs
-          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }} 
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
           CHANNEL_LINK: ${{ github.event.inputs.channel_link }}
         run: python main.py
