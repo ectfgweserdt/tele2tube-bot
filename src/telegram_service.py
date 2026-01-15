@@ -1,60 +1,46 @@
 import os
-from telethon import TelegramClient
-from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.errors import UserAlreadyParticipantError
+from telethon import events
+from telethon.tl.types import MessageMediaDocument
 
-async def download_latest_video(client, channel_entity, download_path):
+async def download_latest_video(client, channel_link, download_path):
     """
-    Connects to a channel and downloads the latest video file.
+    Downloads the most recent video from a specified Telegram channel.
+    Supports usernames, public links, and private channel IDs.
     """
-    print("Successfully connected to Telegram.")
+    print(f"Successfully connected to Telegram.")
     
-    channel = None
     try:
-        # Check if it's a private join link or a public username
-        if 'joinchat' in channel_entity or '+' in channel_entity:
-            # Simple heuristic for private links
-            try:
-                invite_hash = channel_entity.split('/')[-1].replace('+', '')
-                updates = await client(ImportChatInviteRequest(invite_hash))
-                channel = updates.chats[0]
-                print(f"Successfully joined private channel: {channel.title}")
-            except UserAlreadyParticipantError:
-                print("Already a member of this private channel.")
-                # We need to resolve the entity if we are already a member
-                # This might require the user to pass the channel ID or cached entity in a real scenario
-                # For this implementation, we assume the entity is accessible after join
-                pass 
+        # If the input looks like a private channel ID (-100...), convert to int
+        if isinstance(channel_link, str) and (channel_link.startswith('-100') or channel_link.isdigit()):
+            entity_id = int(channel_link)
+        else:
+            # Handle links like https://t.me/c/12345/67 by extracting the ID
+            if "/c/" in channel_link:
+                parts = channel_link.split('/')
+                # The ID is usually the part after 'c'
+                idx = parts.index('c') + 1
+                entity_id = int(f"-100{parts[idx]}")
+            else:
+                entity_id = channel_link
+
+        entity = await client.get_entity(entity_id)
+        print(f"Accessed entity: {entity.title if hasattr(entity, 'title') else 'Private Channel'}")
+
+        # Fetch the last 10 messages to find a video
+        async for message in client.iter_messages(entity, limit=10):
+            if message.video or (message.document and message.document.mime_type.startswith('video/')):
+                print(f"Found video: {message.file.name or 'untitled_video'}")
+                
+                # Ensure the download path exists
+                os.makedirs(download_path, exist_ok=True)
+                
+                path = await message.download_media(file=download_path)
+                print(f"Downloaded to: {path}")
+                return path
         
-        if not channel:
-            # Try getting entity directly (public channel or already joined)
-            channel = await client.get_entity(channel_entity)
-            
+        print("No videos found in the last 10 messages.")
+        return None
+
     except Exception as e:
         print(f"Could not get channel entity: {e}")
         return None
-
-    print(f"Searching for videos in '{channel.title if hasattr(channel, 'title') else channel_entity}'...")
-    
-    # Iterate through messages to find the newest video
-    async for message in client.iter_messages(channel, limit=50):
-        if message.video:
-            print(f"Found video with ID: {message.id}. Downloading...")
-            
-            # Determine filename
-            original_filename = "unknown_video.mp4"
-            if message.video.attributes:
-                # attributes[-1] is usually DocumentAttributeFilename
-                for attr in message.video.attributes:
-                    if hasattr(attr, 'file_name'):
-                        original_filename = attr.file_name
-                        break
-            
-            file_path = await message.download_media(
-                file=os.path.join(download_path, f"{message.id}_{original_filename}")
-            )
-            print(f"Video downloaded successfully to: {file_path}")
-            return file_path
-            
-    print("No new videos found in the recent messages.")
-    return None
