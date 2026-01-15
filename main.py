@@ -31,8 +31,10 @@ async def main_workflow():
     # Initialize the client
     client = TelegramClient(config.SESSION_NAME, config.API_ID, config.API_HASH)
     
-    # CRITICAL FIX: Use bot_token for non-interactive login in GitHub Actions
-    async with client.start(bot_token=config.BOT_TOKEN):
+    # FIX: Correct way to start the bot and use it as a context manager
+    await client.start(bot_token=config.BOT_TOKEN)
+    
+    async with client:
         print(f"Logged in successfully as bot. Checking channel: {config.CHANNEL_ENTITY}")
         downloaded_file = await download_latest_video(client, config.CHANNEL_ENTITY, config.DOWNLOAD_PATH)
         
@@ -40,7 +42,7 @@ async def main_workflow():
             print("Workflow finished: No new video found or error during download.")
             return
 
-    # 2. Inspect & Process Media
+    # 2. Inspect & Process Media (Outside the 'async with client' block to free Telegram resources)
     video_index, audio_index = inspect_and_select_streams(downloaded_file)
     if video_index is None or audio_index is None:
         print("Could not find valid video/audio streams.")
