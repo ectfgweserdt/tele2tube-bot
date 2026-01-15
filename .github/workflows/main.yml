@@ -8,7 +8,7 @@ on:
         required: true
         type: string
 
-# Prevent concurrent runs to save bandwidth and API limits
+# Prevent concurrent runs from fighting for IP/Network bandwidth
 concurrency: 
   group: telegram-upload
   cancel-in-progress: false 
@@ -18,20 +18,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
-          
+          cache: 'pip' # Automated caching for faster startup
+
+      - name: Maximize Runner Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
       - name: Install System Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg atomicparsley
-          
-      - name: Install Python Dependencies
-        run: pip install --no-cache-dir -r requirements.txt
-        
+          sudo apt-get install -y ffmpeg jq
+          # Verify ffmpeg has x264/aac support
+          ffmpeg -version
+
+      - name: Install High-Speed Libraries
+        run: |
+          pip install --upgrade pip
+          pip install --no-cache-dir -r requirements.txt
+
       - name: Execute Pipeline
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
@@ -42,4 +54,6 @@ jobs:
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
+          # Force IPv4/IPv6 preference if needed for stability
+          PYTHONUNBUFFERED: "1" 
         run: python uploader_script.py "${{ github.event.inputs.telegram_link }}"
