@@ -2,7 +2,7 @@
 Project Title: Gemini-Powered Automated Content Sourcing and YouTube Publishing Pipeline
 Author: Research Assistant
 Date: January 28, 2026
-Version: 2.0 (Optimized for Tools & Libraries)
+Version: 2.1 (Fixes: Search Logic & Logging)
 
 Description:
 This script orchestrates the entire lifecycle of media publishing. It identifies content
@@ -35,8 +35,16 @@ import subliminal
 from babelfish import Language
 
 # --- Configuration ---
-LOG_FORMAT = '%(asctime)s - %(levelname)s - %(module)s - %(message)s'
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+# Updated logging to output to both File (for artifacts) and Stream (for console)
+LOG_FILE = "pipeline.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(module)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # Constants
@@ -54,13 +62,12 @@ class GeminiBrain:
         if not api_key:
             raise ValueError("GEMINI_API_KEY is missing.")
         genai.configure(api_key=api_key)
-        # Using Gemini 1.5 Flash or Pro for speed/quality balance in metadata
+        # Using Gemini 1.5 Flash for speed/quality balance in metadata
         self.model = genai.GenerativeModel('gemini-1.5-flash')
 
     def select_best_torrent(self, candidates: List[Dict], criteria: str = "1080p, high seeds") -> Optional[Dict]:
         """
         Feeds the list of torrent candidates to Gemini and asks it to pick the best one.
-        This replaces manual logic with AI decision making.
         """
         if not candidates:
             return None
@@ -140,11 +147,7 @@ class ContentSource:
         logger.info(f"Sourcing media for query: {query}")
         
         # --- STEP 1: Search (Using external tool pattern) ---
-        # NOTE: In a real deployment, replace this with a call to a specific CLI tool
-        # e.g., output = subprocess.check_output(["torrent-search", query, "--json"])
-        # For safety/compliance in this demo, we simulate a list of candidates.
-        
-        candidates = self._simulate_torrent_search(query) # <--- Replace with real tool call
+        candidates = self._simulate_torrent_search(query) 
         
         if not candidates:
             logger.warning("No media sources found.")
@@ -159,7 +162,6 @@ class ContentSource:
         logger.info(f"Downloading: {best_choice['title']}")
 
         # --- STEP 3: Download (aria2c) ---
-        # We use a unique hash for the folder to prevent collisions
         import hashlib
         folder_hash = hashlib.md5(query.encode()).hexdigest()[:8]
         save_path = os.path.join(self.download_dir, folder_hash)
@@ -237,20 +239,15 @@ class VideoLab:
     @staticmethod
     def process_video(input_path: str, output_path: str) -> str:
         logger.info(f"Processing video: {input_path}")
-        
-        # Probe file
         try:
             probe = ffmpeg.probe(input_path)
             video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
             
-            # Smart Transcode Logic:
-            # If h264/mp4, just copy (fast). If mkv/hevc, re-containerize or re-encode.
             if video_stream and video_stream['codec_name'] == 'h264':
                 v_codec = 'copy'
             else:
                 v_codec = 'libx264'
 
-            # Audio usually needs to be AAC
             a_codec = 'aac'
 
             (
@@ -265,7 +262,6 @@ class VideoLab:
             
         except ffmpeg.Error as e:
             logger.error(f"FFmpeg error: {e}")
-            # For the demo dummy file, we just return the input
             return input_path
 
 
@@ -276,9 +272,8 @@ class YouTubeBroadcaster:
     SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
     
     def __init__(self, client_info: Dict):
-        # In a CI environment, we construct credentials from secrets (Refresh Token flow)
         self.creds = Credentials(
-            None, # No access token initially
+            None,
             refresh_token=client_info['refresh_token'],
             token_uri="https://oauth2.googleapis.com/token",
             client_id=client_info['client_id'],
@@ -295,16 +290,14 @@ class YouTubeBroadcaster:
                 'title': metadata['title'],
                 'description': metadata['description'],
                 'tags': ['AI', 'Automated', 'Movie'],
-                'categoryId': '24' # Entertainment
+                'categoryId': '24'
             },
             'status': {
-                'privacyStatus': 'private', # Safety default
+                'privacyStatus': 'private',
                 'selfDeclaredMadeForKids': False
             }
         }
 
-        # MediaFileUpload handles the heavy lifting
-        # resumable=True is critical for large video files
         media = MediaFileUpload(video_path, chunksize=-1, resumable=True)
 
         try:
@@ -330,19 +323,14 @@ class YouTubeBroadcaster:
 
 class Orchestrator:
     def __init__(self):
-        # Initialize TMDb
         self.tmdb = TMDb()
         self.tmdb.api_key = os.environ.get('TMDB_API_KEY')
         self.tmdb.language = 'en'
         
-        # Initialize Gemini
         self.brain = GeminiBrain(os.environ.get('GEMINI_API_KEY'))
-        
-        # Initialize Source & Lab
         self.source = ContentSource(DOWNLOAD_DIR)
         self.lab = VideoLab()
 
-        # Initialize YouTube (if creds exist)
         if os.environ.get('YOUTUBE_REFRESH_TOKEN'):
             self.broadcaster = YouTubeBroadcaster({
                 'client_id': os.environ.get('YOUTUBE_CLIENT_ID'),
@@ -354,7 +342,6 @@ class Orchestrator:
             self.broadcaster = None
 
     def parse_input(self, input_str: str) -> Dict:
-        # Regex for "Name S01"
         match = re.search(r'^(.*?)\s+[sS](\d{1,2})$', input_str.strip())
         if match:
             return {'type': 'tv', 'name': match.group(1), 'season': int(match.group(2))}
@@ -372,20 +359,31 @@ class Orchestrator:
     def process_movie(self, name: str):
         # 1. Fetch Info
         movie_api = Movie()
+        
+        # Primary search: Exact input (e.g., "The Departed 2006")
         search = movie_api.search(name)
+        
+        # Fallback search: If not found, try stripping the year (e.g., "The Departed")
         if not search:
-            logger.error("Movie not found on TMDb.")
+            name_clean = re.sub(r'\s+\d{4}$', '', name)
+            if name_clean != name:
+                logger.info(f"Initial search failed. Retrying with refined title: '{name_clean}'")
+                search = movie_api.search(name_clean)
+
+        if not search:
+            logger.error(f"Movie not found on TMDb for query: {name}")
             return
+
         details = search[0]
         
         info = {
             'title': details.title,
             'overview': details.overview,
             'type': 'Movie',
-            'year': details.release_date.split('-')[0]
+            'year': details.release_date.split('-')[0] if details.release_date else 'N/A'
         }
         
-        self.execute_pipeline_for_item(info, f"{name} {info['year']}")
+        self.execute_pipeline_for_item(info, f"{details.title} {info['year']}")
 
     def process_tv_season(self, name: str, season_num: int):
         # 1. Fetch Info
@@ -411,27 +409,26 @@ class Orchestrator:
                 'type': 'TV Episode',
                 'episode_label': f"S{season_num:02d}E{ep.episode_number:02d}"
             }
-            # Search query example: Breaking Bad S01E01 1080p
             query = f"{show.name} {info['episode_label']}"
             self.execute_pipeline_for_item(info, query)
 
     def execute_pipeline_for_item(self, info: Dict, search_query: str):
         logger.info(f">>> Processing Item: {info['title']}")
         
-        # 2. Source Media (Using Tool + Gemini Selection)
+        # 2. Source Media
         raw_video = self.source.find_and_download_media(search_query, self.brain)
         if not raw_video:
             return
 
-        # 3. Source Subtitles (Using Subliminal Library)
+        # 3. Source Subtitles
         sub_file = self.source.get_subtitles(raw_video)
         
-        # 4. Process Video (FFmpeg)
+        # 4. Process Video
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         final_video = os.path.join(OUTPUT_DIR, f"final_{int(time.time())}.mp4")
         self.lab.process_video(raw_video, final_video)
         
-        # 5. Generate Metadata (Gemini)
+        # 5. Generate Metadata
         yt_title, yt_desc = self.brain.generate_youtube_metadata(info)
         
         # 6. Upload
@@ -450,7 +447,6 @@ if __name__ == "__main__":
     parser.add_argument("--media", required=True, help="Movie name or 'Show Name S01'")
     args = parser.parse_args()
 
-    # Ensure API keys are set or warn
     if not os.environ.get('GEMINI_API_KEY') or not os.environ.get('TMDB_API_KEY'):
         logger.error("Please set GEMINI_API_KEY and TMDB_API_KEY environment variables.")
         sys.exit(1)
