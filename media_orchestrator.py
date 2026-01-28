@@ -1,6 +1,7 @@
 """
-Project Title: Gemini-Powered Automated Media Pipeline (Re-Engineered)
-Version: 4.0 (Prowlarr Integration + Series Support + Robust Error Handling)
+Project: Gemini-Powered Media Pipeline (Serverless Prowlarr Edition)
+Sources: YTS + The Pirate Bay + SolidTorrents
+Feature: Auto-Tracker Injection for Max Speed
 """
 
 import os
@@ -11,7 +12,8 @@ import time
 import logging
 import requests
 import shutil
-from typing import List, Dict, Optional, Tuple, Any
+import urllib.parse
+from typing import List, Dict, Optional, Tuple
 
 import google.generativeai as genai
 from tmdbv3api import TMDb, Movie, TV
@@ -19,283 +21,261 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 
-# --- Configuration & Logging ---
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+# --- Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class Config:
     TMDB_KEY = os.environ.get('TMDB_API_KEY')
     GEMINI_KEY = os.environ.get('GEMINI_API_KEY')
     RD_KEY = os.environ.get('REAL_DEBRID_API_KEY')
-    PROWLARR_URL = os.environ.get('PROWLARR_URL', 'http://localhost:9696')
-    PROWLARR_KEY = os.environ.get('PROWLARR_API_KEY')
+    # YouTube Auth
     YT_CLIENT_ID = os.environ.get('YOUTUBE_CLIENT_ID')
     YT_CLIENT_SECRET = os.environ.get('YOUTUBE_CLIENT_SECRET')
     YT_REFRESH_TOKEN = os.environ.get('YOUTUBE_REFRESH_TOKEN')
 
+    # List of open trackers to boost speed
+    TRACKERS = [
+        "udp://tracker.opentrackr.org:1337/announce",
+        "udp://open.demonii.com:1337/announce",
+        "udp://tracker.coppersurfer.tk:6969/announce",
+        "udp://tracker.leechers-paradise.org:6969/announce",
+        "udp://9.rarbg.to:2710/announce",
+        "udp://tracker.openbittorrent.com:80/announce"
+    ]
+
+class MagnetUtils:
+    @staticmethod
+    def boost_speed(magnet: str) -> str:
+        """Appends open trackers to the magnet link to find more seeders."""
+        if "&tr=" in magnet: return magnet
+        trackers = "&tr=".join([urllib.parse.quote(t) for t in Config.TRACKERS])
+        return f"{magnet}&tr={trackers}"
+
 class GeminiBrain:
     def __init__(self):
-        if not Config.GEMINI_KEY: raise ValueError("GEMINI_API_KEY missing.")
         genai.configure(api_key=Config.GEMINI_KEY)
-        self.model = genai.GenerativeModel('gemini-2.0-flash') # Updated to latest stable model
+        self.model = genai.GenerativeModel('gemini-2.0-flash')
 
     def select_best_source(self, candidates: List[Dict], media_type: str) -> Optional[Dict]:
         if not candidates: return None
-        # Cap candidates to avoid token limits
-        safe_candidates = candidates[:15]
+        # Filter: Remove results with 0 seeds to save tokens
+        viable = [c for c in candidates if c['seeds'] > 0]
+        if not viable: return None
+        
+        # Sort by seeds and take top 20
+        top_candidates = sorted(viable, key=lambda x: x['seeds'], reverse=True)[:20]
         
         prompt = (
-            f"You are a Quality Control bot. Select the best torrent for a {media_type}.\n"
-            f"Priorities: 1. High Seeders (Speed) 2. Resolution (1080p/4k) 3. No excessive size (>20GB is too big).\n"
-            f"Input Candidates: {json.dumps(safe_candidates)}\n"
-            f"Return ONLY raw JSON: {{'index': <int>, 'reason': '<string>'}}"
+            f"Role: Expert Media Curator.\n"
+            f"Goal: Select the best torrent for a '{media_type}'.\n"
+            f"Criteria:\n"
+            f"1. QUALITY: Prioritize '1080p', '4k', 'BluRay'. Avoid 'CAM', 'TS'.\n"
+            f"2. SPEED: High seed count is critical.\n"
+            f"3. MATCH: Ensure it matches the request (Season packs vs Episodes).\n"
+            f"Candidates: {json.dumps(top_candidates)}\n"
+            f"Return JSON ONLY: {{'index': <int>, 'reason': '<string>'}}"
         )
         try:
             response = self.model.generate_content(prompt)
-            clean_text = response.text.replace('```json', '').replace('```', '').strip()
-            data = json.loads(clean_text)
+            text = response.text.replace('```json', '').replace('```', '').strip()
+            data = json.loads(text)
             idx = data.get('index', 0)
-            logger.info(f"Gemini Selected: {safe_candidates[idx]['title']} | Reason: {data.get('reason')}")
-            return safe_candidates[idx]
+            choice = top_candidates[idx]
+            logger.info(f"Gemini Selected: {choice['title']} | Reason: {data.get('reason')}")
+            return choice
         except Exception as e:
-            logger.error(f"Brain selection failed: {e}. Defaulting to first result.")
-            return candidates[0]
+            logger.error(f"AI Selection failed: {e}. Defaulting to highest seeder.")
+            return top_candidates[0]
 
-    def generate_metadata(self, info: Dict) -> Tuple[str, str]:
-        prompt = (
-            f"Write a catchy YouTube Title and SEO Description for: {info['title']}.\n"
-            f"Overview: {info['overview']}\n"
-            "Return JSON: {'title': '...', 'description': '...'}"
-        )
+    def generate_metadata(self, title: str, overview: str) -> Tuple[str, str]:
+        prompt = f"Create a viral YouTube Title and SEO Description for '{title}'. Plot: {overview}. Return JSON {{'title': '...', 'description': '...'}}"
         try:
             res = self.model.generate_content(prompt)
             data = json.loads(res.text.replace('```json', '').replace('```', '').strip())
             return data['title'], data['description']
         except:
-            return info['title'], info.get('overview', 'No description.')
+            return title, overview
 
-class ProwlarrSearcher:
-    """Replaces YTSScraper. Aggregates results from ALL trackers configured in Prowlarr."""
+class Aggregator:
+    """The 'Serverless Prowlarr' - Queries multiple public APIs"""
     
     @staticmethod
-    def search(query: str, category: str = "2000,5000") -> List[Dict]:
-        """
-        Categories: 2000 (Movies), 5000 (TV).
-        """
-        if not Config.PROWLARR_URL or not Config.PROWLARR_KEY:
-            logger.warning("Prowlarr config missing. Falling back to YTS (Movies only).")
-            return ProwlarrSearcher._fallback_yts(query)
-
-        url = f"{Config.PROWLARR_URL}/api/v1/search"
-        params = {
-            'apikey': Config.PROWLARR_KEY,
-            'query': query,
-            'categories': category, # Movies & TV
-            'type': 'search',
-            'limit': 20,
-        }
-        
+    def search_yts(query: str) -> List[Dict]:
+        """Source 1: YTS (Excellent for Movies)"""
         try:
-            logger.info(f"Querying Prowlarr: {query} (Cats: {category})")
-            res = requests.get(url, params=params, timeout=20)
-            res.raise_for_status()
-            results = res.json()
-            
-            # Normalize Data
-            normalized = []
-            for item in results:
-                # Filter out dead torrents
-                if item.get('seeders', 0) == 0: continue
-                
-                normalized.append({
-                    "title": item.get('title'),
-                    "size": item.get('size'),
-                    "seeders": item.get('seeders'),
-                    "magnet": item.get('magnetUrl') or item.get('downloadUrl'),
-                    "indexer": item.get('indexer')
-                })
-            
-            # Sort by seeders descending
-            normalized.sort(key=lambda x: x['seeders'], reverse=True)
-            return normalized
-            
-        except Exception as e:
-            logger.error(f"Prowlarr Search Error: {e}")
-            return []
-
-    @staticmethod
-    def _fallback_yts(query: str) -> List[Dict]:
-        # Legacy fallback logic for Movies
-        url = f"https://yts.mx/api/v2/list_movies.json?query_term={query}&sort_by=seeds"
-        try:
-            r = requests.get(url, timeout=10).json()
-            movies = r.get('data', {}).get('movies', [])
+            url = f"https://yts.mx/api/v2/list_movies.json?query_term={query}&sort_by=seeds"
+            data = requests.get(url, timeout=5).json()
+            movies = data.get('data', {}).get('movies', [])
             results = []
-            for m in movies:
-                for t in m.get('torrents', []):
-                    results.append({
-                        "title": f"{m['title']} {t['quality']}",
-                        "seeders": t['seeds'],
-                        "magnet": f"magnet:?xt=urn:btih:{t['hash']}&dn={m['title']}",
-                        "source": "YTS-Fallback"
-                    })
+            if movies:
+                for m in movies:
+                    for t in m.get('torrents', []):
+                        results.append({
+                            "title": f"YTS: {m['title']} ({t['quality']})",
+                            "seeds": t['seeds'],
+                            "size": t['size'],
+                            "magnet": MagnetUtils.boost_speed(f"magnet:?xt=urn:btih:{t['hash']}&dn={urllib.parse.quote(m['title'])}"),
+                            "source": "YTS"
+                        })
             return results
         except:
             return []
 
-class RealDebridDownloader:
+    @staticmethod
+    def search_apibay(query: str) -> List[Dict]:
+        """Source 2: The Pirate Bay (Huge Database for Series)"""
+        try:
+            url = "https://apibay.org/q.php"
+            params = {"q": query, "cat": ""} 
+            data = requests.get(url, params=params, timeout=10).json()
+            
+            results = []
+            if data and isinstance(data, list) and data[0].get('name') != 'No results returned':
+                for item in data:
+                    if int(item['seeders']) == 0: continue
+                    results.append({
+                        "title": item['name'],
+                        "seeds": int(item['seeders']),
+                        "size": f"{int(item['size']) / (1024*1024):.1f} MB",
+                        "magnet": MagnetUtils.boost_speed(f"magnet:?xt=urn:btih:{item['info_hash']}&dn={urllib.parse.quote(item['name'])}"),
+                        "source": "TPB"
+                    })
+            return results
+        except Exception as e:
+            logger.error(f"TPB Error: {e}")
+            return []
+            
+    @staticmethod
+    def search_solid(query: str) -> List[Dict]:
+        """Source 3: SolidTorrents (Aggregator of DHT/Other Sites)"""
+        try:
+            url = "https://solidtorrents.to/api/v1/search"
+            params = {"q": query, "sort": "seeders"}
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            data = requests.get(url, params=params, headers=headers, timeout=10).json()
+            
+            results = []
+            for item in data.get('results', []):
+                if item['swarm']['seeders'] == 0: continue
+                results.append({
+                    "title": item['title'],
+                    "seeds": item['swarm']['seeders'],
+                    "size": f"{item['size'] / (1024*1024):.1f} MB",
+                    "magnet": MagnetUtils.boost_speed(item['magnet']),
+                    "source": "SolidTorrents"
+                })
+            return results
+        except:
+            return []
+
+class RealDebrid:
     def __init__(self):
         self.api_key = Config.RD_KEY
-        self.base_url = "https://api.real-debrid.com/rest/1.0"
+        self.base = "https://api.real-debrid.com/rest/1.0"
         self.headers = {"Authorization": f"Bearer {Config.RD_KEY}"}
 
-    def download(self, magnet: str, target_dir: str) -> List[str]:
-        if not self.api_key: return []
-        downloaded_files = []
-        
+    def download(self, magnet: str, path: str) -> Optional[str]:
+        if not self.api_key: return None
         try:
             # 1. Add Magnet
-            r = requests.post(f"{self.base_url}/torrents/addMagnet", data={'magnet': magnet}, headers=self.headers).json()
+            r = requests.post(f"{self.base}/torrents/addMagnet", data={'magnet': magnet}, headers=self.headers).json()
             if 'error' in r: raise Exception(r['error'])
             tid = r['id']
-            
-            # 2. Get Info to see files
-            info = requests.get(f"{self.base_url}/torrents/info/{tid}", headers=self.headers).json()
-            
-            # 3. Select Files (Naive: Select largest file for movies, or all for series)
-            # For stability, we select 'all' to ensure the content is cached
-            requests.post(f"{self.base_url}/torrents/selectFiles/{tid}", data={'files': 'all'}, headers=self.headers)
-            
-            # 4. Loop wait for conversion
-            status = "queued"
-            while status in ["queued", "downloading", "compressing"]:
-                time.sleep(2)
-                info = requests.get(f"{self.base_url}/torrents/info/{tid}", headers=self.headers).json()
-                status = info['status']
-                if status == 'magnet_error': raise Exception("Magnet Error on RD side")
 
-            # 5. Get Unrestricted Links
-            if not info.get('links'): raise Exception("No links generated")
+            # 2. Select Files (All)
+            requests.post(f"{self.base}/torrents/selectFiles/{tid}", data={'files': 'all'}, headers=self.headers)
+
+            # 3. Wait for Cache
+            logger.info("Verifying Real-Debrid Cache...")
+            for _ in range(15): # Wait max 30s
+                info = requests.get(f"{self.base}/torrents/info/{tid}", headers=self.headers).json()
+                if info['status'] == 'downloaded': break
+                if info['status'] == 'magnet_error': raise Exception("Invalid Magnet")
+                time.sleep(2)
             
-            # Download Logic: Limit to 3 files to prevent flooding disk
-            for link in info['links'][:3]:
-                unrestrict = requests.post(f"{self.base_url}/unrestrict/link", data={'link': link}, headers=self.headers).json()
-                filename = unrestrict['filename']
-                
-                # Filter non-video files
-                if not any(filename.lower().endswith(ext) for ext in ['.mp4', '.mkv', '.avi']):
-                    continue
-                    
-                path = os.path.join(target_dir, filename)
-                logger.info(f"Downloading: {filename} ({int(unrestrict['filesize']/1024/1024)} MB)")
-                
-                with requests.get(unrestrict['download'], stream=True) as dl:
-                    dl.raise_for_status()
-                    with open(path, 'wb') as f:
-                        shutil.copyfileobj(dl.raw, f)
-                downloaded_files.append(path)
-                
-            return downloaded_files
+            if info['status'] != 'downloaded':
+                logger.warning("Torrent NOT cached on RD. Downloading would be too slow.")
+                return None
+
+            # 4. Download Largest Video File
+            video_files = [f for f in info['files'] if f['path'].lower().endswith(('.mp4', '.mkv', '.avi'))]
+            if not video_files: raise Exception("No video files found")
             
+            # Sort by size to get main movie/episode
+            largest = sorted(video_files, key=lambda x: x['bytes'], reverse=True)[0]
+            link_to_unrestrict = info['links'][info['files'].index(largest) if len(info['links']) == len(info['files']) else 0]
+            
+            # Unrestrict
+            unrestrict = requests.post(f"{self.base}/unrestrict/link", data={'link': link_to_unrestrict}, headers=self.headers).json()
+            
+            # Stream Download
+            save_path = os.path.join(path, unrestrict['filename'])
+            logger.info(f"Downloading: {unrestrict['filename']} ({int(unrestrict['filesize']/1024/1024)} MB)")
+            
+            with requests.get(unrestrict['download'], stream=True) as r:
+                r.raise_for_status()
+                with open(save_path, 'wb') as f:
+                    shutil.copyfileobj(r.raw, f)
+            return save_path
+
         except Exception as e:
-            logger.error(f"RD Error: {e}")
-            return []
+            logger.error(f"RD Download Error: {e}")
+            return None
 
 class Orchestrator:
     def __init__(self):
         self.brain = GeminiBrain()
-        self.rd = RealDebridDownloader()
+        self.rd = RealDebrid()
         self.tmdb = TMDb()
         self.tmdb.api_key = Config.TMDB_KEY
         
         if Config.YT_REFRESH_TOKEN:
-            self.yt_service = self._get_yt_service()
+            info = {"client_id": Config.YT_CLIENT_ID, "client_secret": Config.YT_CLIENT_SECRET, "refresh_token": Config.YT_REFRESH_TOKEN, "type": "authorized_user"}
+            self.yt = build('youtube', 'v3', credentials=Credentials.from_authorized_user_info(info))
         else:
-            self.yt_service = None
+            self.yt = None
 
-    def _get_yt_service(self):
-        info = {
-            "client_id": Config.YT_CLIENT_ID,
-            "client_secret": Config.YT_CLIENT_SECRET,
-            "refresh_token": Config.YT_REFRESH_TOKEN,
-            "type": "authorized_user"
-        }
-        creds = Credentials.from_authorized_user_info(info)
-        return build('youtube', 'v3', credentials=creds)
-
-    def run(self, query: str):
-        logger.info(f"--- Processing: {query} ---")
+    def run(self, media_name: str):
+        logger.info(f"=== Starting Pipeline for: {media_name} ===")
         
-        # 1. Determine Content Type via TMDB
-        # Check Movie first
-        movie_search = Movie().search(query)
-        tv_search = TV().search(query)
+        # 1. Gather Metadata
+        is_series = "S0" in media_name.upper() or "E0" in media_name.upper()
+        media_type = "Series" if is_series else "Movie"
         
-        is_movie = True
-        media_info = {}
+        # 2. AGGREGATED SEARCH
+        logger.info("Scraping [YTS, PirateBay, SolidTorrents]...")
+        candidates = []
+        candidates.extend(Aggregator.search_yts(media_name))
+        candidates.extend(Aggregator.search_apibay(media_name))
+        candidates.extend(Aggregator.search_solid(media_name))
         
-        # Simple heuristic: Higher popularity wins
-        movie_pop = movie_search[0].popularity if movie_search else 0
-        tv_pop = tv_search[0].popularity if tv_search else 0
+        logger.info(f"Found {len(candidates)} total results.")
         
-        if tv_pop > movie_pop:
-            is_movie = False
-            top = tv_search[0]
-            media_info = {'title': top.name, 'overview': top.overview, 'year': top.first_air_date[:4]}
-            search_query = top.name # For Series, search the name directly
-            category_ids = "5000" # TV Category
-        else:
-            if not movie_search:
-                logger.error("Content not found on TMDB")
-                return
-            top = movie_search[0]
-            media_info = {'title': top.title, 'overview': top.overview, 'year': top.release_date[:4]}
-            search_query = f"{top.title} {top.release_date[:4]}"
-            category_ids = "2000" # Movie Category
-
-        logger.info(f"Identified as: {'Movie' if is_movie else 'Series'} | Title: {media_info['title']}")
-
-        # 2. Search (Prowlarr)
-        candidates = ProwlarrSearcher.search(search_query, category=category_ids)
-        if not candidates:
-            logger.error("No torrents found.")
+        # 3. AI SELECTION
+        best_source = self.brain.select_best_source(candidates, media_type)
+        if not best_source: 
+            logger.error("No suitable sources found.")
             return
 
-        # 3. Select Best
-        best = self.brain.select_best_source(candidates, 'Movie' if is_movie else 'Series')
-        if not best: return
-
-        # 4. Download
+        # 4. DOWNLOAD
         os.makedirs("downloads", exist_ok=True)
-        files = self.rd.download(best['magnet'], "downloads")
+        file_path = self.rd.download(best_source['magnet'], "downloads")
         
-        if not files:
-            logger.error("Download failed.")
-            return
-
-        # 5. Upload (First file only)
-        if self.yt_service and files:
-            self.upload_to_youtube(files[0], media_info)
-
-    def upload_to_youtube(self, path: str, meta: Dict):
-        title, desc = self.brain.generate_metadata(meta)
-        logger.info(f"Uploading {title}...")
-        
-        body = {
-            'snippet': {'title': title[:100], 'description': desc, 'categoryId': '24'},
-            'status': {'privacyStatus': 'private'}
-        }
+        if file_path and self.yt:
+            # 5. UPLOAD (Optional)
+            t, d = self.brain.generate_metadata(best_source['title'], "Uploaded via Gemini Pipeline")
+            self.upload_youtube(file_path, t, d)
+            
+    def upload_youtube(self, path, title, desc):
+        logger.info(f"Uploading: {title}")
+        body = {'snippet': {'title': title[:100], 'description': desc, 'categoryId': '24'}, 'status': {'privacyStatus': 'private'}}
         media = MediaFileUpload(path, resumable=True)
-        self.yt_service.videos().insert(part='snippet,status', body=body, media_body=media).execute()
-        logger.info("Upload Complete.")
+        self.yt.videos().insert(part='snippet,status', body=body, media_body=media).execute()
+        logger.info("Upload Success!")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--media", required=True, help="Movie or Series name")
+    parser.add_argument("--media", required=True)
     args = parser.parse_args()
-    
     Orchestrator().run(args.media)
