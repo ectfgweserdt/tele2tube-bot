@@ -2,7 +2,7 @@
 Project Title: Gemini-Powered Automated Content Sourcing and YouTube Publishing Pipeline
 Author: Research Assistant
 Date: January 28, 2026
-Version: 2.4 (Fixes: YouTube Credentials instantiation for Refresh flow)
+Version: 2.5 (Fixes: Secret naming mismatch for YOUTUBE_CLIENT_SECRETS)
 """
 
 import os
@@ -121,21 +121,6 @@ class ContentSource:
         
         return dummy_file
 
-    def get_subtitles(self, video_path: str, lang_code: str = 'eng') -> Optional[str]:
-        logger.info(f"Searching for subtitles for: {video_path}")
-        try:
-            lang = Language.fromalpha3(lang_code)
-            video = subliminal.Video.fromname(video_path)
-            best_subtitles = subliminal.download_best_subtitles([video], {lang})
-            
-            if best_subtitles.get(video):
-                sub_path = os.path.splitext(video_path)[0] + f".{lang_code}.srt"
-                subliminal.save_subtitles(video, [best_subtitles[video][0]])
-                return sub_path
-        except Exception as e:
-            logger.error(f"Subtitle download failed: {e}")
-        return None
-
 
 class VideoLab:
     @staticmethod
@@ -158,7 +143,6 @@ class VideoLab:
 
 class YouTubeBroadcaster:
     def __init__(self, client_info: Dict):
-        # Using Credentials.from_authorized_user_info is safer for handling refreshes
         info = {
             "client_id": client_info['client_id'],
             "client_secret": client_info['client_secret'],
@@ -203,11 +187,12 @@ class Orchestrator:
         
         self.broadcaster = None
         cid = os.environ.get('YOUTUBE_CLIENT_ID')
-        sec = os.environ.get('YOUTUBE_CLIENT_SECRET')
+        # Check both singular and plural (based on your repository secret name)
+        sec = os.environ.get('YOUTUBE_CLIENT_SECRET') or os.environ.get('YOUTUBE_CLIENT_SECRETS')
         ref = os.environ.get('YOUTUBE_REFRESH_TOKEN')
 
         if ref and cid and sec:
-            logger.info("Initializing YouTube Broadcaster with provided credentials.")
+            logger.info("Initializing YouTube Broadcaster with detected credentials.")
             self.broadcaster = YouTubeBroadcaster({
                 'client_id': cid,
                 'client_secret': sec,
