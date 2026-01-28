@@ -2,7 +2,7 @@
 Project Title: Gemini-Powered Automated Content Sourcing and YouTube Publishing Pipeline
 Author: Research Assistant
 Date: January 28, 2026
-Version: 2.5 (Fixes: Secret naming mismatch for YOUTUBE_CLIENT_SECRETS)
+Version: 2.6 (Enhanced Environment Debugging)
 """
 
 import os
@@ -45,9 +45,6 @@ OUTPUT_DIR = "./ready_to_upload"
 # --- Modules ---
 
 class GeminiBrain:
-    """
-    The Intelligence Unit. Uses Gemini to make decisions and generate text.
-    """
     def __init__(self, api_key: str):
         if not api_key:
             raise ValueError("GEMINI_API_KEY is missing.")
@@ -57,25 +54,21 @@ class GeminiBrain:
     def select_best_torrent(self, candidates: List[Dict], criteria: str = "1080p, high seeds") -> Optional[Dict]:
         if not candidates:
             return None
-
         prompt = f"""
         Act as a Media Archival Expert. Select the SINGLE best source based on: {criteria}.
         Return ONLY a JSON object: {{ "best_index": <int>, "reason": "<string>" }}
         Candidates: {json.dumps(candidates)}
         """
-        
         try:
             response = self.model.generate_content(prompt)
             text = response.text.replace('```json', '').replace('```', '').strip()
             decision = json.loads(text)
             best_idx = decision.get("best_index")
-            
             if best_idx is not None and 0 <= best_idx < len(candidates):
                 logger.info(f"Gemini selected candidate #{best_idx}: {decision.get('reason')}")
                 return candidates[best_idx]
         except Exception as e:
             logger.error(f"Gemini failed to select torrent: {e}")
-        
         return sorted(candidates, key=lambda x: x.get('seeds', 0), reverse=True)[0]
 
     def generate_youtube_metadata(self, media_info: Dict) -> Tuple[str, str]:
@@ -105,20 +98,16 @@ class ContentSource:
             {"title": f"{query} 1080p BluRay", "seeds": 150, "magnet": "mag1"},
             {"title": f"{query} 720p WEB-DL", "seeds": 450, "magnet": "mag2"}
         ]
-        
         best_choice = brain.select_best_torrent(candidates)
         if not best_choice: return None
-        
         import hashlib
         folder_hash = hashlib.md5(query.encode()).hexdigest()[:8]
         save_path = os.path.join(self.download_dir, folder_hash)
         os.makedirs(save_path, exist_ok=True)
-        
         dummy_file = os.path.join(save_path, "movie.mp4")
         if not os.path.exists(dummy_file):
             with open(dummy_file, 'wb') as f:
                 f.write(b'\x00' * 2048) 
-        
         return dummy_file
 
 
@@ -135,7 +124,7 @@ class VideoLab:
                 .run(capture_stdout=True, capture_stderr=True)
             )
             return True
-        except ffmpeg.Error as e:
+        except ffmpeg.Error:
             logger.warning("FFmpeg noted invalid data (likely dummy file). Proceeding with simulation copy.")
             shutil.copy(input_path, output_path)
             return True
@@ -156,7 +145,6 @@ class YouTubeBroadcaster:
         if not os.path.exists(video_path):
             logger.error(f"Upload aborted: File not found at {video_path}")
             return None
-
         logger.info(f"Starting YouTube Upload for {video_path}...")
         try:
             body = {
@@ -179,6 +167,10 @@ class YouTubeBroadcaster:
 
 class Orchestrator:
     def __init__(self):
+        # Debugging: Log available env vars (keys only)
+        yt_vars = [k for k in os.environ.keys() if k.startswith("YOUTUBE_")]
+        logger.info(f"Detected Environment Variables: {yt_vars}")
+
         self.tmdb = TMDb()
         self.tmdb.api_key = os.environ.get('TMDB_API_KEY')
         self.brain = GeminiBrain(os.environ.get('GEMINI_API_KEY'))
@@ -187,12 +179,12 @@ class Orchestrator:
         
         self.broadcaster = None
         cid = os.environ.get('YOUTUBE_CLIENT_ID')
-        # Check both singular and plural (based on your repository secret name)
+        # Check plural and singular versions
         sec = os.environ.get('YOUTUBE_CLIENT_SECRET') or os.environ.get('YOUTUBE_CLIENT_SECRETS')
         ref = os.environ.get('YOUTUBE_REFRESH_TOKEN')
 
         if ref and cid and sec:
-            logger.info("Initializing YouTube Broadcaster with detected credentials.")
+            logger.info("Initializing YouTube Broadcaster...")
             self.broadcaster = YouTubeBroadcaster({
                 'client_id': cid,
                 'client_secret': sec,
@@ -206,7 +198,6 @@ class Orchestrator:
         logger.info(f"--- Starting Pipeline for: {media_input} ---")
         movie_api = Movie()
         search = movie_api.search(media_input)
-        
         if not search:
             clean_name = re.sub(r'\s+\d{4}$', '', media_input)
             search = movie_api.search(clean_name)
@@ -216,21 +207,14 @@ class Orchestrator:
             return
 
         item = search[0]
-        info = {
-            'title': item.title, 
-            'overview': item.overview, 
-            'year': getattr(item, 'release_date', '0000')[:4]
-        }
+        info = {'title': item.title, 'overview': item.overview, 'year': getattr(item, 'release_date', '0000')[:4]}
         
-        # 1. Source
         raw_video = self.source.find_and_download_media(f"{info['title']} {info['year']}", self.brain)
         if not raw_video: return
 
-        # 2. Process
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         processed_video = os.path.join(OUTPUT_DIR, f"final_{int(time.time())}.mp4")
         if self.lab.process_video(raw_video, processed_video):
-            # 3. Metadata & Upload
             yt_title, yt_desc = self.brain.generate_youtube_metadata(info)
             if self.broadcaster:
                 self.broadcaster.upload(processed_video, {'title': yt_title, 'description': yt_desc})
@@ -241,9 +225,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--media", required=True)
     args = parser.parse_args()
-    
     if not os.environ.get('TMDB_API_KEY') or not os.environ.get('GEMINI_API_KEY'):
         logger.error("Missing critical API keys (TMDB or GEMINI).")
         sys.exit(1)
-        
     Orchestrator().run(args.media)
