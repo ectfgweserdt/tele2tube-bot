@@ -2,7 +2,7 @@
 Project Title: Gemini-Powered Automated Content Sourcing and YouTube Publishing Pipeline
 Author: Research Assistant
 Date: January 28, 2026
-Version: 2.6 (Enhanced Environment Debugging)
+Version: 2.7 (Fixes: "Processing Abandoned" by generating valid test video)
 """
 
 import os
@@ -100,15 +100,30 @@ class ContentSource:
         ]
         best_choice = brain.select_best_torrent(candidates)
         if not best_choice: return None
+        
         import hashlib
         folder_hash = hashlib.md5(query.encode()).hexdigest()[:8]
         save_path = os.path.join(self.download_dir, folder_hash)
         os.makedirs(save_path, exist_ok=True)
-        dummy_file = os.path.join(save_path, "movie.mp4")
-        if not os.path.exists(dummy_file):
-            with open(dummy_file, 'wb') as f:
-                f.write(b'\x00' * 2048) 
-        return dummy_file
+        
+        # Generator: Create a valid test video instead of a zero-byte dummy file
+        video_path = os.path.join(save_path, "movie.mp4")
+        if not os.path.exists(video_path):
+            logger.info("Generating valid test video for pipeline validation...")
+            try:
+                # Generates a 5-second SMPTE test pattern with a 1kHz tone
+                (
+                    ffmpeg
+                    .input('testsrc=duration=5:size=1280x720:rate=30', f='lavfi')
+                    .output(ffmpeg.input('sine=frequency=1000:duration=5', f='lavfi').audio, video_path)
+                    .overwrite_output()
+                    .run(capture_stdout=True, capture_stderr=True)
+                )
+            except ffmpeg.Error as e:
+                logger.error(f"Failed to generate test video: {e.stderr.decode()}")
+                return None
+        
+        return video_path
 
 
 class VideoLab:
@@ -119,15 +134,14 @@ class VideoLab:
             (
                 ffmpeg
                 .input(input_path)
-                .output(output_path, vcodec='copy', acodec='copy')
+                .output(output_path, vcodec='libx264', acodec='aac', pix_fmt='yuv420p')
                 .overwrite_output()
                 .run(capture_stdout=True, capture_stderr=True)
             )
             return True
-        except ffmpeg.Error:
-            logger.warning("FFmpeg noted invalid data (likely dummy file). Proceeding with simulation copy.")
-            shutil.copy(input_path, output_path)
-            return True
+        except ffmpeg.Error as e:
+            logger.error(f"FFmpeg processing failed: {e.stderr.decode()}")
+            return False
 
 
 class YouTubeBroadcaster:
@@ -167,7 +181,6 @@ class YouTubeBroadcaster:
 
 class Orchestrator:
     def __init__(self):
-        # Debugging: Log available env vars (keys only)
         yt_vars = [k for k in os.environ.keys() if k.startswith("YOUTUBE_")]
         logger.info(f"Detected Environment Variables: {yt_vars}")
 
@@ -179,7 +192,6 @@ class Orchestrator:
         
         self.broadcaster = None
         cid = os.environ.get('YOUTUBE_CLIENT_ID')
-        # Check plural and singular versions
         sec = os.environ.get('YOUTUBE_CLIENT_SECRET') or os.environ.get('YOUTUBE_CLIENT_SECRETS')
         ref = os.environ.get('YOUTUBE_REFRESH_TOKEN')
 
