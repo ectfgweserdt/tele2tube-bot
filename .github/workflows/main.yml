@@ -37,11 +37,11 @@ jobs:
     - name: Run Pipeline
       env:
         # Secrets must be configured in Repo Settings -> Secrets and Variables
-        TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
-        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-        YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-        YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+         TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+         YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+         YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRETS }} # Map plural to singular here
+         YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
       run: |
         python media_orchestrator.py --media "${{ github.event.inputs.media_title }}"
 
