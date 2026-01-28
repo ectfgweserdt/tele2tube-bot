@@ -1,7 +1,8 @@
-telethon
-google-api-python-client
-google-auth-oauthlib
-google-auth-httplib2
-requests
-parse-torrent-name
-google-genai
+google-generativeai==0.3.2
+google-api-python-client==2.111.0
+google-auth-oauthlib==1.2.0
+tmdbv3api==1.7.7
+ffmpeg-python==0.2.0
+subliminal==2.1.0
+requests==2.31.0
+babelfish==0.6.0
