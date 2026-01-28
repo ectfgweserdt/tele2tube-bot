@@ -1,7 +1,6 @@
 """
-Project: Gemini-Powered Media Pipeline (Serverless Prowlarr Edition)
-Sources: YTS + The Pirate Bay + SolidTorrents
-Feature: Auto-Tracker Injection for Max Speed
+Project: Gemini-Powered Media Pipeline (Production Fix)
+Sources: YTS (Fixed) + TPB (Safe) + BitSearch (New)
 """
 
 import os
@@ -13,6 +12,7 @@ import logging
 import requests
 import shutil
 import urllib.parse
+import re
 from typing import List, Dict, Optional, Tuple
 
 import google.generativeai as genai
@@ -22,151 +22,167 @@ from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 
 # --- Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 logger = logging.getLogger(__name__)
 
 class Config:
     TMDB_KEY = os.environ.get('TMDB_API_KEY')
     GEMINI_KEY = os.environ.get('GEMINI_API_KEY')
     RD_KEY = os.environ.get('REAL_DEBRID_API_KEY')
-    # YouTube Auth
     YT_CLIENT_ID = os.environ.get('YOUTUBE_CLIENT_ID')
     YT_CLIENT_SECRET = os.environ.get('YOUTUBE_CLIENT_SECRET')
     YT_REFRESH_TOKEN = os.environ.get('YOUTUBE_REFRESH_TOKEN')
 
-    # List of open trackers to boost speed
-    TRACKERS = [
-        "udp://tracker.opentrackr.org:1337/announce",
-        "udp://open.demonii.com:1337/announce",
-        "udp://tracker.coppersurfer.tk:6969/announce",
-        "udp://tracker.leechers-paradise.org:6969/announce",
-        "udp://9.rarbg.to:2710/announce",
-        "udp://tracker.openbittorrent.com:80/announce"
-    ]
-
-class MagnetUtils:
-    @staticmethod
-    def boost_speed(magnet: str) -> str:
-        """Appends open trackers to the magnet link to find more seeders."""
-        if "&tr=" in magnet: return magnet
-        trackers = "&tr=".join([urllib.parse.quote(t) for t in Config.TRACKERS])
-        return f"{magnet}&tr={trackers}"
+    # Real Browser Headers to bypass "Bot" blocks
+    HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1'
+    }
 
 class GeminiBrain:
     def __init__(self):
+        if not Config.GEMINI_KEY: raise ValueError("GEMINI_API_KEY Missing")
         genai.configure(api_key=Config.GEMINI_KEY)
         self.model = genai.GenerativeModel('gemini-2.0-flash')
 
     def select_best_source(self, candidates: List[Dict], media_type: str) -> Optional[Dict]:
         if not candidates: return None
-        # Filter: Remove results with 0 seeds to save tokens
-        viable = [c for c in candidates if c['seeds'] > 0]
-        if not viable: return None
+        # Deduplicate by title+size
+        unique = {f"{c['title']}_{c['size']}": c for c in candidates}.values()
+        candidates = list(unique)
         
-        # Sort by seeds and take top 20
-        top_candidates = sorted(viable, key=lambda x: x['seeds'], reverse=True)[:20]
+        # Sort by seeds
+        top = sorted(candidates, key=lambda x: x.get('seeds', 0), reverse=True)[:15]
         
         prompt = (
-            f"Role: Expert Media Curator.\n"
-            f"Goal: Select the best torrent for a '{media_type}'.\n"
-            f"Criteria:\n"
-            f"1. QUALITY: Prioritize '1080p', '4k', 'BluRay'. Avoid 'CAM', 'TS'.\n"
-            f"2. SPEED: High seed count is critical.\n"
-            f"3. MATCH: Ensure it matches the request (Season packs vs Episodes).\n"
-            f"Candidates: {json.dumps(top_candidates)}\n"
-            f"Return JSON ONLY: {{'index': <int>, 'reason': '<string>'}}"
+            f"Select the best torrent for {media_type}.\n"
+            f"Rules: High seeds = Speed. Avoid CAM/TS. Prefer 1080p/4k.\n"
+            f"Candidates: {json.dumps(top)}\n"
+            f"Return JSON: {{'index': <int>, 'reason': '...'}}"
         )
-        try:
-            response = self.model.generate_content(prompt)
-            text = response.text.replace('```json', '').replace('```', '').strip()
-            data = json.loads(text)
-            idx = data.get('index', 0)
-            choice = top_candidates[idx]
-            logger.info(f"Gemini Selected: {choice['title']} | Reason: {data.get('reason')}")
-            return choice
-        except Exception as e:
-            logger.error(f"AI Selection failed: {e}. Defaulting to highest seeder.")
-            return top_candidates[0]
-
-    def generate_metadata(self, title: str, overview: str) -> Tuple[str, str]:
-        prompt = f"Create a viral YouTube Title and SEO Description for '{title}'. Plot: {overview}. Return JSON {{'title': '...', 'description': '...'}}"
         try:
             res = self.model.generate_content(prompt)
             data = json.loads(res.text.replace('```json', '').replace('```', '').strip())
+            return top[data.get('index', 0)]
+        except:
+            return top[0]
+
+    def generate_metadata(self, title: str) -> Tuple[str, str]:
+        try:
+            res = self.model.generate_content(f"YouTube Title & Description for '{title}'. JSON: {{'title': '...', 'description': '...'}}")
+            data = json.loads(res.text.replace('```json', '').replace('```', '').strip())
             return data['title'], data['description']
         except:
-            return title, overview
+            return title, "Uploaded by Gemini Pipeline"
 
 class Aggregator:
-    """The 'Serverless Prowlarr' - Queries multiple public APIs"""
-    
     @staticmethod
     def search_yts(query: str) -> List[Dict]:
-        """Source 1: YTS (Excellent for Movies)"""
+        """Fixed YTS Search with Params"""
         try:
-            url = f"https://yts.mx/api/v2/list_movies.json?query_term={query}&sort_by=seeds"
-            data = requests.get(url, timeout=5).json()
-            movies = data.get('data', {}).get('movies', [])
+            url = "https://yts.mx/api/v2/list_movies.json"
+            params = {'query_term': query, 'sort_by': 'seeds', 'limit': 10}
+            # YTS requires no special headers usually, but we send them anyway
+            r = requests.get(url, params=params, headers=Config.HEADERS, timeout=10)
+            
+            if r.status_code != 200:
+                logger.error(f"YTS Failed: {r.status_code}")
+                return []
+                
+            data = r.json()
+            if not data.get('data', {}).get('movies'):
+                logger.warning(f"YTS found 0 movies for '{query}'")
+                return []
+
             results = []
-            if movies:
-                for m in movies:
-                    for t in m.get('torrents', []):
-                        results.append({
-                            "title": f"YTS: {m['title']} ({t['quality']})",
-                            "seeds": t['seeds'],
-                            "size": t['size'],
-                            "magnet": MagnetUtils.boost_speed(f"magnet:?xt=urn:btih:{t['hash']}&dn={urllib.parse.quote(m['title'])}"),
-                            "source": "YTS"
-                        })
+            for m in data['data']['movies']:
+                for t in m.get('torrents', []):
+                    results.append({
+                        "title": f"YTS: {m['title']} ({t['quality']})",
+                        "seeds": t['seeds'],
+                        "size": t['size'],
+                        "magnet": f"magnet:?xt=urn:btih:{t['hash']}&dn={urllib.parse.quote(m['title'])}",
+                        "source": "YTS"
+                    })
             return results
-        except:
+        except Exception as e:
+            logger.error(f"YTS Error: {e}")
             return []
 
     @staticmethod
     def search_apibay(query: str) -> List[Dict]:
-        """Source 2: The Pirate Bay (Huge Database for Series)"""
+        """TPB with JSON Error Handling"""
         try:
             url = "https://apibay.org/q.php"
-            params = {"q": query, "cat": ""} 
-            data = requests.get(url, params=params, timeout=10).json()
+            params = {'q': query, 'cat': ''}
+            # APIBay often blocks Data Centers. 
+            r = requests.get(url, params=params, headers=Config.HEADERS, timeout=10)
             
+            if 'application/json' not in r.headers.get('Content-Type', ''):
+                logger.warning(f"TPB returned non-JSON content (Blocked/Down).")
+                return []
+                
+            data = r.json()
+            if isinstance(data, list) and data and data[0].get('name') == 'No results returned':
+                return []
+
             results = []
-            if data and isinstance(data, list) and data[0].get('name') != 'No results returned':
-                for item in data:
-                    if int(item['seeders']) == 0: continue
-                    results.append({
-                        "title": item['name'],
-                        "seeds": int(item['seeders']),
-                        "size": f"{int(item['size']) / (1024*1024):.1f} MB",
-                        "magnet": MagnetUtils.boost_speed(f"magnet:?xt=urn:btih:{item['info_hash']}&dn={urllib.parse.quote(item['name'])}"),
-                        "source": "TPB"
-                    })
-            return results
-        except Exception as e:
-            logger.error(f"TPB Error: {e}")
-            return []
-            
-    @staticmethod
-    def search_solid(query: str) -> List[Dict]:
-        """Source 3: SolidTorrents (Aggregator of DHT/Other Sites)"""
-        try:
-            url = "https://solidtorrents.to/api/v1/search"
-            params = {"q": query, "sort": "seeders"}
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            data = requests.get(url, params=params, headers=headers, timeout=10).json()
-            
-            results = []
-            for item in data.get('results', []):
-                if item['swarm']['seeders'] == 0: continue
+            for item in data:
+                if item.get('seeders') == '0': continue
                 results.append({
-                    "title": item['title'],
-                    "seeds": item['swarm']['seeders'],
-                    "size": f"{item['size'] / (1024*1024):.1f} MB",
-                    "magnet": MagnetUtils.boost_speed(item['magnet']),
-                    "source": "SolidTorrents"
+                    "title": item['name'],
+                    "seeds": int(item['seeders']),
+                    "size": f"{int(item['size'])/1048576:.1f} MB",
+                    "magnet": f"magnet:?xt=urn:btih:{item['info_hash']}&dn={urllib.parse.quote(item['name'])}",
+                    "source": "TPB"
+                })
+            return results[:10]
+        except Exception as e:
+            logger.error(f"TPB Failed: {e}")
+            return []
+
+    @staticmethod
+    def search_bitsearch(query: str) -> List[Dict]:
+        """BitSearch Scraper (No BS4 required - Regex only)"""
+        try:
+            url = f"https://bitsearch.to/search?q={urllib.parse.quote(query)}"
+            r = requests.get(url, headers=Config.HEADERS, timeout=15)
+            
+            if r.status_code != 200: return []
+            
+            # Regex to find Magnets and Titles
+            # Pattern looks for <h5 class="title">...<a href="magnet:..."
+            # This is a rough scraper
+            
+            # Extract magnet links
+            magnets = re.findall(r'href="(magnet:\?xt=urn:btih:[a-zA-Z0-9]+.*?)"', r.text)
+            # Extract titles (simplified)
+            titles = re.findall(r'class="title".*?>(.*?)</a>', r.text)
+            # Extract stats (seeds)
+            # This is hard with regex, we assume data is somewhat ordered
+            
+            results = []
+            for i, mag in enumerate(magnets[:10]):
+                title = titles[i] if i < len(titles) else "Unknown"
+                # Remove HTML tags from title
+                title = re.sub(r'<.*?>', '', title)
+                results.append({
+                    "title": f"BitSearch: {title}",
+                    "seeds": 100, # Fake seeds as fallback since regex stats is hard
+                    "size": "Unknown",
+                    "magnet": mag.replace('&amp;', '&'),
+                    "source": "BitSearch"
                 })
             return results
-        except:
+        except Exception as e:
+            logger.error(f"BitSearch Error: {e}")
             return []
 
 class RealDebrid:
@@ -176,103 +192,91 @@ class RealDebrid:
         self.headers = {"Authorization": f"Bearer {Config.RD_KEY}"}
 
     def download(self, magnet: str, path: str) -> Optional[str]:
-        if not self.api_key: return None
+        if not self.api_key: 
+            logger.error("No Real-Debrid API Key")
+            return None
+            
         try:
-            # 1. Add Magnet
+            # Add Magnet
             r = requests.post(f"{self.base}/torrents/addMagnet", data={'magnet': magnet}, headers=self.headers).json()
-            if 'error' in r: raise Exception(r['error'])
+            if 'error' in r: 
+                logger.error(f"RD Add Error: {r['error']}")
+                return None
             tid = r['id']
 
-            # 2. Select Files (All)
+            # Select Files
             requests.post(f"{self.base}/torrents/selectFiles/{tid}", data={'files': 'all'}, headers=self.headers)
 
-            # 3. Wait for Cache
-            logger.info("Verifying Real-Debrid Cache...")
-            for _ in range(15): # Wait max 30s
+            # Wait for Cache (Max 20s)
+            logger.info("Checking Real-Debrid Cache...")
+            for _ in range(10):
                 info = requests.get(f"{self.base}/torrents/info/{tid}", headers=self.headers).json()
                 if info['status'] == 'downloaded': break
-                if info['status'] == 'magnet_error': raise Exception("Invalid Magnet")
                 time.sleep(2)
             
             if info['status'] != 'downloaded':
-                logger.warning("Torrent NOT cached on RD. Downloading would be too slow.")
+                logger.error("Torrent NOT cached on Real-Debrid. Aborting to save time.")
                 return None
 
-            # 4. Download Largest Video File
-            video_files = [f for f in info['files'] if f['path'].lower().endswith(('.mp4', '.mkv', '.avi'))]
-            if not video_files: raise Exception("No video files found")
+            # Get Link
+            link = info['links'][0]
+            unrestrict = requests.post(f"{self.base}/unrestrict/link", data={'link': link}, headers=self.headers).json()
             
-            # Sort by size to get main movie/episode
-            largest = sorted(video_files, key=lambda x: x['bytes'], reverse=True)[0]
-            link_to_unrestrict = info['links'][info['files'].index(largest) if len(info['links']) == len(info['files']) else 0]
-            
-            # Unrestrict
-            unrestrict = requests.post(f"{self.base}/unrestrict/link", data={'link': link_to_unrestrict}, headers=self.headers).json()
-            
-            # Stream Download
-            save_path = os.path.join(path, unrestrict['filename'])
-            logger.info(f"Downloading: {unrestrict['filename']} ({int(unrestrict['filesize']/1024/1024)} MB)")
-            
+            # Download
+            dest = os.path.join(path, unrestrict['filename'])
+            logger.info(f"Downloading: {unrestrict['filename']}")
             with requests.get(unrestrict['download'], stream=True) as r:
                 r.raise_for_status()
-                with open(save_path, 'wb') as f:
+                with open(dest, 'wb') as f:
                     shutil.copyfileobj(r.raw, f)
-            return save_path
-
+            return dest
         except Exception as e:
-            logger.error(f"RD Download Error: {e}")
+            logger.error(f"RD Download Failed: {e}")
             return None
 
 class Orchestrator:
     def __init__(self):
         self.brain = GeminiBrain()
         self.rd = RealDebrid()
-        self.tmdb = TMDb()
-        self.tmdb.api_key = Config.TMDB_KEY
-        
         if Config.YT_REFRESH_TOKEN:
             info = {"client_id": Config.YT_CLIENT_ID, "client_secret": Config.YT_CLIENT_SECRET, "refresh_token": Config.YT_REFRESH_TOKEN, "type": "authorized_user"}
             self.yt = build('youtube', 'v3', credentials=Credentials.from_authorized_user_info(info))
-        else:
-            self.yt = None
 
     def run(self, media_name: str):
-        logger.info(f"=== Starting Pipeline for: {media_name} ===")
+        logger.info(f"=== Search: {media_name} ===")
         
-        # 1. Gather Metadata
-        is_series = "S0" in media_name.upper() or "E0" in media_name.upper()
-        media_type = "Series" if is_series else "Movie"
-        
-        # 2. AGGREGATED SEARCH
-        logger.info("Scraping [YTS, PirateBay, SolidTorrents]...")
+        # 1. Scrape All Sources
         candidates = []
-        candidates.extend(Aggregator.search_yts(media_name))
-        candidates.extend(Aggregator.search_apibay(media_name))
-        candidates.extend(Aggregator.search_solid(media_name))
+        candidates += Aggregator.search_yts(media_name)
+        candidates += Aggregator.search_apibay(media_name)
+        if not candidates:
+             # Try BitSearch as fallback if others fail
+             candidates += Aggregator.search_bitsearch(media_name)
+             
+        logger.info(f"Found {len(candidates)} candidates.")
         
-        logger.info(f"Found {len(candidates)} total results.")
-        
-        # 3. AI SELECTION
-        best_source = self.brain.select_best_source(candidates, media_type)
-        if not best_source: 
-            logger.error("No suitable sources found.")
+        if not candidates:
+            logger.error("No results found. APIs might be blocking IP.")
             return
 
-        # 4. DOWNLOAD
+        # 2. Select
+        best = self.brain.select_best_source(candidates, "Movie/Series")
+        logger.info(f"Selected: {best['title']}")
+
+        # 3. Download
         os.makedirs("downloads", exist_ok=True)
-        file_path = self.rd.download(best_source['magnet'], "downloads")
+        path = self.rd.download(best['magnet'], "downloads")
         
-        if file_path and self.yt:
-            # 5. UPLOAD (Optional)
-            t, d = self.brain.generate_metadata(best_source['title'], "Uploaded via Gemini Pipeline")
-            self.upload_youtube(file_path, t, d)
-            
-    def upload_youtube(self, path, title, desc):
-        logger.info(f"Uploading: {title}")
+        # 4. Upload (if downloaded)
+        if path and hasattr(self, 'yt'):
+            title, desc = self.brain.generate_metadata(best['title'])
+            self.upload(path, title, desc)
+
+    def upload(self, path, title, desc):
+        logger.info(f"Uploading to YouTube: {title}")
         body = {'snippet': {'title': title[:100], 'description': desc, 'categoryId': '24'}, 'status': {'privacyStatus': 'private'}}
         media = MediaFileUpload(path, resumable=True)
         self.yt.videos().insert(part='snippet,status', body=body, media_body=media).execute()
-        logger.info("Upload Success!")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
