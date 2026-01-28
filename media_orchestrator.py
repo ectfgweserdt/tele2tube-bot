@@ -2,7 +2,7 @@
 Project Title: Gemini-Powered Automated Content Sourcing and YouTube Publishing Pipeline
 Author: Research Assistant
 Date: January 28, 2026
-Version: 2.3 (Fixes: YouTube client_secret, FFmpeg dummy handling)
+Version: 2.4 (Fixes: YouTube Credentials instantiation for Refresh flow)
 """
 
 import os
@@ -116,8 +116,6 @@ class ContentSource:
         
         dummy_file = os.path.join(save_path, "movie.mp4")
         if not os.path.exists(dummy_file):
-            # Create a small dummy file. FFmpeg might complain if it's too small, 
-            # so we'll handle that in VideoLab.
             with open(dummy_file, 'wb') as f:
                 f.write(b'\x00' * 2048) 
         
@@ -144,8 +142,6 @@ class VideoLab:
     def process_video(input_path: str, output_path: str) -> bool:
         logger.info(f"Processing video: {input_path}")
         try:
-            # We check if file is a real video before running FFmpeg
-            # In simulation, we bypass the error and just copy the file.
             (
                 ffmpeg
                 .input(input_path)
@@ -155,8 +151,6 @@ class VideoLab:
             )
             return True
         except ffmpeg.Error as e:
-            # If FFmpeg fails (expected for dummy bytes), we manually create the output
-            # so the pipeline can proceed to metadata/upload logic.
             logger.warning("FFmpeg noted invalid data (likely dummy file). Proceeding with simulation copy.")
             shutil.copy(input_path, output_path)
             return True
@@ -164,15 +158,14 @@ class VideoLab:
 
 class YouTubeBroadcaster:
     def __init__(self, client_info: Dict):
-        # FIX: Ensure all tokens and IDs are passed for the refresh flow
-        self.creds = Credentials(
-            token=None,
-            refresh_token=client_info['refresh_token'],
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=client_info['client_id'],
-            client_secret=client_info['client_secret'], # Ensure this is passed!
-            scopes=['https://www.googleapis.com/auth/youtube.upload']
-        )
+        # Using Credentials.from_authorized_user_info is safer for handling refreshes
+        info = {
+            "client_id": client_info['client_id'],
+            "client_secret": client_info['client_secret'],
+            "refresh_token": client_info['refresh_token'],
+            "type": "authorized_user"
+        }
+        self.creds = Credentials.from_authorized_user_info(info, scopes=['https://www.googleapis.com/auth/youtube.upload'])
         self.service = build('youtube', 'v3', credentials=self.creds)
 
     def upload(self, video_path: str, metadata: Dict) -> Optional[str]:
@@ -192,8 +185,6 @@ class YouTubeBroadcaster:
             }
             media = MediaFileUpload(video_path, chunksize=-1, resumable=True)
             request = self.service.videos().insert(part='snippet,status', body=body, media_body=media)
-            
-            # Using execute() directly for simple one-shot upload in this version
             response = request.execute()
             logger.info(f"Upload Successful! ID: {response.get('id')}")
             return response.get('id')
@@ -211,12 +202,20 @@ class Orchestrator:
         self.lab = VideoLab()
         
         self.broadcaster = None
-        if os.environ.get('YOUTUBE_REFRESH_TOKEN'):
+        cid = os.environ.get('YOUTUBE_CLIENT_ID')
+        sec = os.environ.get('YOUTUBE_CLIENT_SECRET')
+        ref = os.environ.get('YOUTUBE_REFRESH_TOKEN')
+
+        if ref and cid and sec:
+            logger.info("Initializing YouTube Broadcaster with provided credentials.")
             self.broadcaster = YouTubeBroadcaster({
-                'client_id': os.environ.get('YOUTUBE_CLIENT_ID'),
-                'client_secret': os.environ.get('YOUTUBE_CLIENT_SECRET'),
-                'refresh_token': os.environ.get('YOUTUBE_REFRESH_TOKEN')
+                'client_id': cid,
+                'client_secret': sec,
+                'refresh_token': ref
             })
+        else:
+            missing = [k for k, v in {'ID': cid, 'SECRET': sec, 'REFRESH': ref}.items() if not v]
+            logger.warning(f"YouTube Broadcaster disabled. Missing: {', '.join(missing)}")
 
     def run(self, media_input: str):
         logger.info(f"--- Starting Pipeline for: {media_input} ---")
