@@ -1,56 +1,45 @@
-name: Gemini Automated Media Pipeline
+name: Auto Media Pipeline
 
 on:
   workflow_dispatch:
     inputs:
-      media_title:
-        description: 'Target Content (e.g., "Inception" or "Breaking Bad S02")'
+      media_name:
+        description: 'Movie or TV Series Name (e.g., "The Matrix" or "Breaking Bad S01")'
         required: true
-        type: string
+        default: ''
 
 jobs:
-  produce_and_publish:
+  download_and_upload:
     runs-on: ubuntu-latest
     
+    permissions:
+      contents: read
+
     steps:
-    - name: Checkout Code
+    - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Setup Python environment
+    - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.11' # Updated to 3.11 to avoid FutureWarnings
-        cache: 'pip'
+        python-version: '3.11'
 
-    - name: Install System Tools
+    - name: Install System Dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y ffmpeg aria2
-        # Verify installations
-        ffmpeg -version
-        aria2c --version
 
-    - name: Install Python Dependencies
+    - name: Install Python Libraries
       run: |
         pip install -r requirements.txt
 
-    - name: Run Pipeline
+    - name: Run Media Bot
       env:
-        # Secrets must be configured in Repo Settings -> Secrets and Variables
-          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          REAL_DEBRID_API_KEY: ${{ secrets.REAL_DEBRID_API_KEY }} # MUST ADD THIS
-          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
-          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
-          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
+        TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+        YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+        YOUTUBE_CLIENT_SECRETS: ${{ secrets.YOUTUBE_CLIENT_SECRETS }}
+        YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
       run: |
-        python media_orchestrator.py --media "${{ github.event.inputs.media_title }}"
-
-    - name: Upload Logs (Artifacts)
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: pipeline-logs
-        path: |
-          *.log
-          downloads/
+        python media_bot.py --query "${{ github.event.inputs.media_name }}"
