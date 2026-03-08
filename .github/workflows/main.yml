@@ -3,8 +3,8 @@ name: Telegram to YouTube Automation
 on:
   workflow_dispatch:
     inputs:
-      tg_post_link:
-        description: 'Telegram Private Channel Post Link'
+      tg_post_links:
+        description: 'Telegram Post Links (Comma separated for multiple!)'
         required: true
         type: string
 
@@ -40,5 +40,5 @@ jobs:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRETS: ${{ secrets.YOUTUBE_CLIENT_SECRETS }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-          TG_POST_LINK: ${{ github.event.inputs.tg_post_link }}
+          TG_POST_LINKS: ${{ github.event.inputs.tg_post_links }}
         run: python main.py
