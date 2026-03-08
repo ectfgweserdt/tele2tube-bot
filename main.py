@@ -24,8 +24,7 @@ YT_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN")
 TG_POST_LINK = os.environ.get("TG_POST_LINK") # Passed from workflow trigger
 
 # --- Initialization ---
-app = Client("my_bot", api_id=TG_API_ID, api_hash=TG_API_HASH, bot_token=TG_BOT_TOKEN)
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 def get_youtube_service():
     """Authenticates and returns the YouTube API service."""
@@ -55,6 +54,8 @@ def generate_youtube_details(raw_metadata):
     Format response as JSON with keys: 'title', 'description'
     """
     try:
+        if not gemini_client:
+            raise ValueError("Gemini client not initialized.")
         response = gemini_client.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt
@@ -71,11 +72,11 @@ async def download_from_telegram(post_link):
     """Downloads the video file from a given Telegram post link."""
     # Robust link parsing for formats like: https://t.me/c/123456789/123 or https://t.me/username/123
     parts = post_link.rstrip('/').split('/')
-    
+
     try:
         message_id = int(parts[-1])
         chat_id_str = parts[-2]
-        
+
         # Check if it is a private channel link (contains '/c/')
         if len(parts) >= 3 and parts[-3] == 'c':
             chat_id = int("-100" + chat_id_str)
@@ -87,6 +88,10 @@ async def download_from_telegram(post_link):
         return None
 
     print(f"Downloading message {message_id} from chat {chat_id}...")
+    
+    # Initialize the Pyrogram client inside the async scope so it uses the active event loop
+    app = Client("my_bot", api_id=TG_API_ID, api_hash=TG_API_HASH, bot_token=TG_BOT_TOKEN, in_memory=True)
+    
     async with app:
         try:
             message = await app.get_messages(chat_id, message_id)
@@ -129,7 +134,7 @@ def upload_to_youtube(youtube, file_path, title, description, category_id="22"):
     print(f"Uploading {file_path} to YouTube...")
     body = {
         'snippet': {
-            'title': title,
+            'title': title[:100], # YouTube title limit is 100 characters
             'description': description,
             'categoryId': category_id
         },
