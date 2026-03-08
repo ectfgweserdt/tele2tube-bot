@@ -96,34 +96,13 @@ async def download_from_telegram(post_link):
              print(f"Failed to download from Telegram: {e}")
     return None
 
-def extract_streams(video_path):
-    """Uses FFmpeg to extract ONLY English audio and subtitles."""
+def process_video_and_extract_subs(video_path):
+    """Strips foreign languages, keeping ONLY English audio, and extracts English subs."""
     base_name = os.path.splitext(video_path)[0]
-    
-    # Use MP4 container for audio and add a dummy video so YouTube doesn't reject it
-    audio_path = f"{base_name}_eng_audio.mp4"
+    processed_video = f"{base_name}_english_only.mp4"
     sub_path = f"{base_name}_eng_sub.srt"
 
-    # Extract English Audio (Mapping 1:a:m:language:eng:0?)
-    print("Extracting English Audio...")
-    try:
-        # We generate a blank 854x480 video stream so YouTube accepts the "audio" upload
-        subprocess.run([
-            "ffmpeg", "-y", 
-            "-f", "lavfi", "-i", "color=c=black:s=854x480:r=1", 
-            "-i", video_path, 
-            "-map", "1:a:m:language:eng:0?", "-map", "0:v:0", 
-            "-c:a", "aac", "-c:v", "libx264", "-preset", "ultrafast", 
-            "-shortest", audio_path
-        ], check=True)
-        # Verify extraction wasn't empty
-        if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 1024:
-            audio_path = None
-    except subprocess.CalledProcessError:
-        print("English audio extraction failed or wasn't found.")
-        audio_path = None
-
-    # Extract English Subtitles (Mapping 0:s:m:language:eng:0?)
+    # Extract English Subtitles
     print("Extracting English Subtitles...")
     try:
          subprocess.run([
@@ -137,7 +116,22 @@ def extract_streams(video_path):
          print("No English subtitles found or extraction failed.")
          sub_path = None
 
-    return audio_path, sub_path
+    # Process Video: Keep video and English audio, drop everything else
+    print("Processing video to keep ONLY English audio...")
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-i", video_path,
+            "-map", "0:v:0",                 # Map the video stream
+            "-map", "0:a:m:language:eng:0?", # Map the English audio stream
+            "-c:v", "copy",                  # Copy video directly (fast, no re-encoding)
+            "-c:a", "aac",                   # Convert audio to AAC (YouTube friendly)
+            "-strict", "experimental",
+            processed_video
+        ], check=True)
+        return processed_video, sub_path
+    except subprocess.CalledProcessError as e:
+        print(f"Video processing failed: {e}. Falling back to original video.")
+        return video_path, sub_path
 
 def upload_to_youtube(youtube, file_path, title, description, category_id="22"):
     """Uploads a video/audio file to YouTube as a private video."""
@@ -192,8 +186,8 @@ async def main():
         print("Failed to download video. Exiting.")
         return
 
-    # 2. Extract Streams (English only)
-    audio_path, sub_path = extract_streams(video_path)
+    # 2. Process Video (Keep English audio only) & Extract Subtitles
+    processed_video_path, sub_path = process_video_and_extract_subs(video_path)
 
     # 3. Get Metadata & Generate Title/Desc
     search_query = os.path.basename(video_path).replace('.', ' ').split()[0] 
@@ -203,16 +197,12 @@ async def main():
     # 4. Upload to YouTube
     youtube = get_youtube_service()
 
-    # Upload main video
-    main_video_id = upload_to_youtube(youtube, video_path, yt_details['title'] + " (Main)", yt_details['description'])
+    # Upload the cleaned video
+    main_video_id = upload_to_youtube(youtube, processed_video_path, yt_details['title'], yt_details['description'])
 
     # Upload English subtitle as CC to the main video
     if main_video_id and sub_path:
         upload_caption_to_youtube(youtube, main_video_id, sub_path)
-
-    # Upload extracted English audio (with blank video container)
-    if audio_path:
-        upload_to_youtube(youtube, audio_path, yt_details['title'] + " (English Audio Track)", "Extracted English Audio\n\n" + yt_details['description'])
 
 if __name__ == "__main__":
     import asyncio
