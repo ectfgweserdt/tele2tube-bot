@@ -60,38 +60,29 @@ def generate_youtube_details(raw_metadata):
             model='gemini-2.5-flash',
             contents=prompt
         )
-        # Assuming Gemini returns clean JSON
         return json.loads(response.text.strip('```json').strip('```').strip())
     except Exception as e:
         print(f"Gemini generation failed: {e}")
-        title = raw_metadata.get('name') if raw_metadata else "Unknown Title"
-        title = title or raw_metadata.get('title') if raw_metadata else "Unknown Title"
+        title = raw_metadata.get('name') or raw_metadata.get('title') if raw_metadata else "Unknown Title"
         return {"title": title, "description": str(raw_metadata)}
 
 async def download_from_telegram(post_link):
     """Downloads the video file from a given Telegram post link."""
-    # Robust link parsing for formats like: https://t.me/c/123456789/123 or https://t.me/username/123
     parts = post_link.rstrip('/').split('/')
-
     try:
         message_id = int(parts[-1])
         chat_id_str = parts[-2]
-
-        # Check if it is a private channel link (contains '/c/')
         if len(parts) >= 3 and parts[-3] == 'c':
             chat_id = int("-100" + chat_id_str)
         else:
-            # Public channel
             chat_id = chat_id_str 
     except (IndexError, ValueError) as e:
         print(f"Failed to parse Telegram link: {post_link}\nError: {e}")
         return None
 
     print(f"Downloading message {message_id} from chat {chat_id}...")
-    
-    # Initialize the Pyrogram client inside the async scope so it uses the active event loop
     app = Client("my_bot", api_id=TG_API_ID, api_hash=TG_API_HASH, bot_token=TG_BOT_TOKEN, in_memory=True)
-    
+
     async with app:
         try:
             message = await app.get_messages(chat_id, message_id)
@@ -106,25 +97,44 @@ async def download_from_telegram(post_link):
     return None
 
 def extract_streams(video_path):
-    """Uses FFmpeg to extract audio and subtitles from the video file."""
+    """Uses FFmpeg to extract ONLY English audio and subtitles."""
     base_name = os.path.splitext(video_path)[0]
-    audio_path = f"{base_name}_audio.aac"
-    sub_path = f"{base_name}_sub.srt"
+    
+    # Use MP4 container for audio and add a dummy video so YouTube doesn't reject it
+    audio_path = f"{base_name}_eng_audio.mp4"
+    sub_path = f"{base_name}_eng_sub.srt"
 
-    # Extract Audio
-    print("Extracting Audio...")
+    # Extract English Audio (Mapping 1:a:m:language:eng:0?)
+    print("Extracting English Audio...")
     try:
-        subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "copy", audio_path], check=True)
+        # We generate a blank 854x480 video stream so YouTube accepts the "audio" upload
+        subprocess.run([
+            "ffmpeg", "-y", 
+            "-f", "lavfi", "-i", "color=c=black:s=854x480:r=1", 
+            "-i", video_path, 
+            "-map", "1:a:m:language:eng:0?", "-map", "0:v:0", 
+            "-c:a", "aac", "-c:v", "libx264", "-preset", "ultrafast", 
+            "-shortest", audio_path
+        ], check=True)
+        # Verify extraction wasn't empty
+        if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 1024:
+            audio_path = None
     except subprocess.CalledProcessError:
-        print("Audio extraction failed. Proceeding without separate audio.")
+        print("English audio extraction failed or wasn't found.")
         audio_path = None
 
-    # Extract Subtitles (Assuming the video has an embedded subtitle stream)
-    print("Extracting Subtitles...")
+    # Extract English Subtitles (Mapping 0:s:m:language:eng:0?)
+    print("Extracting English Subtitles...")
     try:
-         subprocess.run(["ffmpeg", "-y", "-i", video_path, "-map", "0:s:0", sub_path], check=True)
+         subprocess.run([
+             "ffmpeg", "-y", "-i", video_path, 
+             "-map", "0:s:m:language:eng:0?", 
+             "-c:s", "srt", sub_path
+         ], check=True)
+         if not os.path.exists(sub_path) or os.path.getsize(sub_path) == 0:
+             sub_path = None
     except subprocess.CalledProcessError:
-         print("No subtitles found or extraction failed.")
+         print("No English subtitles found or extraction failed.")
          sub_path = None
 
     return audio_path, sub_path
@@ -134,7 +144,7 @@ def upload_to_youtube(youtube, file_path, title, description, category_id="22"):
     print(f"Uploading {file_path} to YouTube...")
     body = {
         'snippet': {
-            'title': title[:100], # YouTube title limit is 100 characters
+            'title': title[:100], 
             'description': description,
             'categoryId': category_id
         },
@@ -147,8 +157,29 @@ def upload_to_youtube(youtube, file_path, title, description, category_id="22"):
         request = youtube.videos().insert(part=','.join(body.keys()), body=body, media_body=media)
         response = request.execute()
         print(f"Uploaded! Video ID: {response['id']}")
+        return response['id']
     except Exception as e:
         print(f"Failed to upload {file_path} to YouTube: {e}")
+        return None
+
+def upload_caption_to_youtube(youtube, video_id, caption_path):
+    """Uploads a subtitle file as a caption track to a specific YouTube video."""
+    print(f"Uploading English caption to video {video_id}...")
+    body = {
+        'snippet': {
+            'videoId': video_id,
+            'language': 'en',
+            'name': 'English',
+            'isDraft': False
+        }
+    }
+    media = MediaFileUpload(caption_path, mimetype='text/plain', chunksize=-1, resumable=True)
+    try:
+        request = youtube.captions().insert(part='snippet', body=body, media_body=media)
+        request.execute()
+        print("Caption uploaded successfully!")
+    except Exception as e:
+        print(f"Failed to upload caption: {e}")
 
 async def main():
     if not TG_POST_LINK:
@@ -161,10 +192,10 @@ async def main():
         print("Failed to download video. Exiting.")
         return
 
-    # 2. Extract Streams
+    # 2. Extract Streams (English only)
     audio_path, sub_path = extract_streams(video_path)
 
-    # 3. Get Metadata & Generate Title/Desc via Gemini
+    # 3. Get Metadata & Generate Title/Desc
     search_query = os.path.basename(video_path).replace('.', ' ').split()[0] 
     raw_meta = fetch_movie_metadata(search_query)
     yt_details = generate_youtube_details(raw_meta) if raw_meta else {"title": search_query, "description": "Auto-uploaded content."}
@@ -173,11 +204,15 @@ async def main():
     youtube = get_youtube_service()
 
     # Upload main video
-    upload_to_youtube(youtube, video_path, yt_details['title'] + " (Video)", yt_details['description'])
+    main_video_id = upload_to_youtube(youtube, video_path, yt_details['title'] + " (Main)", yt_details['description'])
 
-    # Upload extracted audio 
+    # Upload English subtitle as CC to the main video
+    if main_video_id and sub_path:
+        upload_caption_to_youtube(youtube, main_video_id, sub_path)
+
+    # Upload extracted English audio (with blank video container)
     if audio_path:
-        upload_to_youtube(youtube, audio_path, yt_details['title'] + " (Audio Track)", "Extracted Audio Track\n\n" + yt_details['description'])
+        upload_to_youtube(youtube, audio_path, yt_details['title'] + " (English Audio Track)", "Extracted English Audio\n\n" + yt_details['description'])
 
 if __name__ == "__main__":
     import asyncio
